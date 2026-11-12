@@ -79,7 +79,8 @@ All providers use 2 GB: Render `standard` (1 CPU, 2 GB), Railway limits 1 vCPU /
 
 - Org `personal`. App `bdb-kokoro-fastapi`, https://bdb-kokoro-fastapi.fly.dev. `fly.toml`: one Machine, `iad`, `shared-cpu-1x` with 2048 MB, health check `/health`.
 - Deploy: `flyctl deploy --config fly.toml -a bdb-kokoro-fastapi --remote-only --depot=false --ha=false --strategy bluegreen --yes --build-arg BENCH_COMMIT=<sha> --env BENCH_RUN_ID=<id>` from a `git archive` of the commit.
-- **Not deployed yet.** Two setup deploys ran on 2026-11-12 while other fixtures used the same remote builder (`fly-builder-rosy-headland-8386`, `shared-cpu-8x`). The install step took 1,095 s (other providers: 120 to 150 s). The first deploy stopped when the local shell limit ended flyctl. The second built the image (install layer cached) but one layer push failed after retries; flyctl then rebuilt and the builder answered `unable to upgrade to h2c, received 500`. The app has no Machine. The matrix run waited 2 hours for the shared Fly build lock and did not start.
+- Setup deploy of `1c2d90b` on 2026-11-12 under the shared Fly build lock: install 338 s, image 3.2 GB, `start` to `listening` 49 s. `/version` returned the right commit and run ID, and `/health` returned 200. The app has one Machine, stopped between measurements.
+- Earlier attempts, before the lock: the shared remote builder (`fly-builder-rosy-headland-8386`, `shared-cpu-8x`) took 1,095 s for the install step while other fixtures built on it. One deploy stopped when the local shell limit ended flyctl. Another built the image, but a layer push failed after retries, and the rebuild failed with `unable to upgrade to h2c, received 500`.
 
 ## Matrix check (2026-11-12)
 
@@ -90,4 +91,4 @@ All providers use 2 GB: Render `standard` (1 CPU, 2 GB), Railway limits 1 vCPU /
 | Render | 356 s | 134 s | Resume (`service_resumed`) took 353 s before the runs. Cold cache export to the registry 110 s. Warm `observed_cache` is `partial` and has no install time. |
 | Railway | 677 s | 367 s | App boot (start to listening) 134 s cold and 83 s warm on 1 vCPU, against 20 to 25 s on Render and 16 s on Vercel. |
 | Vercel | 451 s | 607 s, 208 s | The first warm run restored the build cache of the setup deploy `dpl_5ZUFCxYuWPAzmVuuB8QhyuCA2uEn` (older `bench/build.sh`), not of the cold run, so the install step ran again. A second warm run hit the cache (restore 56 s, 3.3 GiB). |
-| Fly | not run | not run | See Fly.io above. |
+| Fly | 865 s | 202 s | Under the Fly build lock, with the remote builder (`--depot=false`). Cold: install 372 s, image push 122 s. Warm: install cached, push 13 s. App boot 48 s in both runs. |
