@@ -1,0 +1,1867 @@
+import asyncio
+import json
+import os
+from typing import AsyncGenerator
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import numpy as np
+import pytest
+from fastapi.testclient import TestClient
+
+from api.src.core.config import settings
+from api.src.inference.base import AudioChunk
+from api.src.main import app
+from api.src.routers.openai_compatible import (
+    _resolve_download_name,
+    create_speech,
+    get_tts_service,
+    load_openai_mappings,
+    stream_audio_chunks,
+)
+from api.src.services.streaming_audio_writer import StreamingAudioWriter
+from api.src.services.tts_service import TTSService
+from api.src.structures.schemas import OpenAISpeechRequest
+
+client = TestClient(app)
+
+
+@pytest.fixture
+def test_voice():
+    """Fixture providing a test voice name."""
+    return "test_voice"
+
+
+@pytest.fixture
+def mock_openai_mappings():
+    """Mock OpenAI mappings for testing."""
+    with patch(
+        "api.src.routers.openai_compatible._openai_mappings",
+        {
+            "models": {"tts-1": "kokoro-v1_0", "tts-1-hd": "kokoro-v1_0"},
+            "voices": {"alloy": "am_adam", "nova": "bf_isabella"},
+        },
+    ):
+        yield
+
+
+@pytest.fixture
+def mock_json_file(tmp_path):
+    """Create a temporary mock JSON file."""
+    content = {
+        "models": {"test-model": "test-kokoro"},
+        "voices": {"test-voice": "test-internal"},
+    }
+    json_file = tmp_path / "test_mappings.json"
+    json_file.write_text(json.dumps(content))
+    return json_file
+
+
+def test_load_openai_mappings(mock_json_file):
+    """Test loading OpenAI mappings from JSON file"""
+    with patch("os.path.join", return_value=str(mock_json_file)):
+        mappings = load_openai_mappings()
+        assert "models" in mappings
+        assert "voices" in mappings
+        assert mappings["models"]["test-model"] == "test-kokoro"
+        assert mappings["voices"]["test-voice"] == "test-internal"
+
+
+def test_load_openai_mappings_file_not_found():
+    """Test handling of missing mappings file"""
+    with patch("os.path.join", return_value="/nonexistent/path"):
+        mappings = load_openai_mappings()
+        assert mappings == {"models": {}, "voices": {}}
+
+
+def test_openai_voice_names_map_to_real_voices():
+    """Every OpenAI voice name maps to a voice file that ships with the repo"""
+    openai_voices = {
+        "alloy",
+        "ash",
+        "ballad",
+        "cedar",
+        "coral",
+        "echo",
+        "fable",
+        "marin",
+        "nova",
+        "onyx",
+        "sage",
+        "shimmer",
+        "verse",
+    }
+    mapped = load_openai_mappings()["voices"]
+    assert openai_voices <= mapped.keys()
+    voices_dir = os.path.join(os.path.dirname(__file__), "..", "src", "voices", "v1_0")
+    for name, target in mapped.items():
+        assert os.path.isfile(os.path.join(voices_dir, f"{target}.pt")), name
+
+
+def test_list_models(mock_openai_mappings):
+    """Test listing available models endpoint"""
+    response = client.get("/v1/models")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "list"
+    assert isinstance(data["data"], list)
+    # Verify all expected models are present
+    model_ids = [model["id"] for model in data["data"]]
+    assert "tts-1" in model_ids
+    assert "tts-1-hd" in model_ids
+    assert "kokoro" in model_ids
+    assert "gpt-4o-mini-tts" in model_ids
+
+    # Verify model format
+    for model in data["data"]:
+        assert model["object"] == "model"
+        assert "created" in model
+        assert model["owned_by"] == "kokoro"
+
+
+def test_retrieve_model(mock_openai_mappings):
+    """Test retrieving a specific model endpoint"""
+    # Test successful model retrieval
+    response = client.get("/v1/models/tts-1")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == "tts-1"
+    assert data["object"] == "model"
+    assert data["owned_by"] == "kokoro"
+    assert "created" in data
+
+    # Test non-existent model
+    response = client.get("/v1/models/nonexistent-model")
+    assert response.status_code == 404
+    error = response.json()
+    assert error["detail"]["error"] == "model_not_found"
+    assert "not found" in error["detail"]["message"]
+    assert error["detail"]["type"] == "invalid_request_error"
+
+
+@pytest.mark.asyncio
+async def test_get_tts_service_initialization():
+    """Callers arriving while the service is being created wait for it, none creates a second one"""
+    gate = asyncio.Event()
+    mock_service = AsyncMock()
+
+    async def create():
+        await gate.wait()
+        return mock_service
+
+    with patch("api.src.routers.openai_compatible._tts_service", None):
+        with patch("api.src.routers.openai_compatible._init_lock", None):
+            with patch(
+                "api.src.services.tts_service.TTSService.create", side_effect=create
+            ) as mock_create:
+                tasks = [asyncio.create_task(get_tts_service()) for _ in range(5)]
+                await asyncio.sleep(0)
+                gate.set()
+                results = await asyncio.gather(*tasks)
+
+                mock_create.assert_called_once()
+                assert all(r is mock_service for r in results)
+
+
+@pytest.mark.asyncio
+async def test_stream_audio_chunks_client_disconnect():
+    """Test handling of client disconnect during streaming"""
+    mock_request = MagicMock()
+    mock_request.is_disconnected = AsyncMock(return_value=True)
+
+    mock_service = AsyncMock()
+
+    async def mock_stream(*args, **kwargs):
+        for i in range(5):
+            yield AudioChunk(np.ndarray([], np.int16), output=b"chunk")
+
+    mock_service.generate_audio_stream = mock_stream
+    mock_service.list_voices.return_value = ["test_voice"]
+
+    request = OpenAISpeechRequest(
+        model="kokoro",
+        input="Test text",
+        voice="test_voice",
+        response_format="mp3",
+        stream=True,
+        speed=1.0,
+    )
+
+    writer = StreamingAudioWriter("mp3", 24000)
+
+    chunks = []
+    async for chunk in stream_audio_chunks(
+        mock_service, request, mock_request, writer, "test_voice"
+    ):
+        chunks.append(chunk)
+
+    writer.close()
+
+    assert len(chunks) == 0  # Should stop immediately due to disconnect
+
+
+@pytest.mark.asyncio
+async def test_stream_audio_chunks_closes_source_on_disconnect():
+    """A disconnect must close the upstream generator, not leave it to the GC."""
+    mock_request = MagicMock()
+    mock_request.is_disconnected = AsyncMock(return_value=True)
+
+    closed = []
+
+    async def mock_stream(*args, **kwargs):
+        try:
+            for _ in range(5):
+                yield AudioChunk(np.ndarray([], np.int16), output=b"chunk")
+        finally:
+            closed.append(True)
+
+    mock_service = AsyncMock()
+    mock_service.generate_audio_stream = mock_stream
+    mock_service.list_voices.return_value = ["test_voice"]
+
+    request = OpenAISpeechRequest(
+        model="kokoro",
+        input="Test text",
+        voice="test_voice",
+        response_format="mp3",
+        stream=True,
+        speed=1.0,
+    )
+
+    writer = StreamingAudioWriter("mp3", 24000)
+    async for _ in stream_audio_chunks(
+        mock_service, request, mock_request, writer, "test_voice"
+    ):
+        pass
+    writer.close()
+
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_abandoned_stream_closes_audio_writer(mock_tts_service):
+    """An abandoned response must close the writer, not leave PyAV to the GC."""
+    writers = []
+    writer_cls = StreamingAudioWriter
+
+    def capture(*args, **kwargs):
+        writer = writer_cls(*args, **kwargs)
+        writers.append(writer)
+        return writer
+
+    closed = []
+
+    async def mock_stream(*args, **kwargs):
+        try:
+            while True:
+                yield AudioChunk(np.zeros(1200, np.int16), output=b"chunk")
+        finally:
+            closed.append(True)
+
+    mock_tts_service.generate_audio_stream = mock_stream
+
+    request = OpenAISpeechRequest(
+        model="kokoro",
+        input="Test text",
+        voice="test_voice",
+        response_format="mp3",
+        stream=True,
+        speed=1.0,
+    )
+
+    client_request = MagicMock()
+    client_request.is_disconnected = AsyncMock(return_value=False)
+
+    with patch("api.src.routers.openai_compatible.StreamingAudioWriter", capture):
+        response = await create_speech(request, client_request)
+        body = response.body_iterator
+        await body.__anext__()
+        await body.aclose()
+
+    assert len(writers) == 1
+    assert writers[0].output_buffer.closed
+    assert closed == [True]
+
+
+def test_openai_voice_mapping(mock_tts_service, mock_openai_mappings):
+    """Test OpenAI voice name mapping"""
+    mock_tts_service.list_voices.return_value = ["am_adam", "bf_isabella"]
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "tts-1",
+            "input": "Hello world",
+            "voice": "alloy",  # OpenAI voice name
+            "response_format": "mp3",
+            "stream": False,
+        },
+    )
+    assert response.status_code == 200
+    mock_tts_service.generate_audio.assert_called_once()
+    assert mock_tts_service.generate_audio.call_args[1]["voice"] == "am_adam"
+
+
+def test_openai_voice_mapping_streaming(
+    mock_tts_service, mock_openai_mappings, mock_audio_bytes
+):
+    """Test OpenAI voice mapping in streaming mode"""
+    mock_tts_service.list_voices.return_value = ["am_adam", "bf_isabella"]
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "tts-1-hd",
+            "input": "Hello world",
+            "voice": "nova",  # OpenAI voice name
+            "response_format": "mp3",
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    content = b""
+    for chunk in response.iter_bytes():
+        content += chunk
+    assert content == mock_audio_bytes
+
+
+def test_invalid_openai_model(mock_tts_service, mock_openai_mappings):
+    """Test error handling for invalid OpenAI model"""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "invalid-model",
+            "input": "Hello world",
+            "voice": "alloy",
+            "response_format": "mp3",
+            "stream": False,
+        },
+    )
+    assert response.status_code == 400
+    error_response = response.json()
+    assert error_response["detail"]["error"] == "invalid_model"
+    assert "Unsupported model" in error_response["detail"]["message"]
+
+
+@pytest.fixture
+def mock_audio_bytes():
+    """Mock audio bytes for testing."""
+    return b"mock audio data"
+
+
+@pytest.fixture
+def mock_tts_service(mock_audio_bytes):
+    """Mock TTS service for testing."""
+    with patch("api.src.routers.openai_compatible.get_tts_service") as mock_get:
+        service = AsyncMock(spec=TTSService)
+        service.generate_audio.return_value = AudioChunk(
+            np.zeros(1000, np.int16), output=mock_audio_bytes
+        )
+
+        async def mock_stream(*args, **kwargs) -> AsyncGenerator[AudioChunk, None]:
+            yield AudioChunk(np.ndarray([], np.int16), output=mock_audio_bytes)
+
+        service.generate_audio_stream = mock_stream
+        service.list_voices.return_value = ["test_voice", "voice1", "voice2"]
+
+        mock_get.return_value = service
+        mock_get.side_effect = None
+        yield service
+
+
+def test_openai_speech_endpoint(mock_tts_service, test_voice, mock_audio_bytes):
+    """Test the OpenAI-compatible speech endpoint with basic MP3 generation"""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "Hello world",
+            "voice": test_voice,
+            "response_format": "mp3",
+            "stream": False,
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/mpeg"
+    assert response.content == mock_audio_bytes
+
+    mock_tts_service.generate_audio.assert_called_once()
+    assert mock_tts_service.generate_audio.call_args.kwargs["output_format"] == "mp3"
+
+
+def test_openai_speech_streaming(mock_tts_service, test_voice, mock_audio_bytes):
+    """Test the OpenAI-compatible speech endpoint with streaming"""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "Hello world",
+            "voice": test_voice,
+            "response_format": "mp3",
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/mpeg"
+    assert "Transfer-Encoding" in response.headers
+    assert response.headers["Transfer-Encoding"] == "chunked"
+
+    content = b""
+    for chunk in response.iter_bytes():
+        content += chunk
+    assert content == mock_audio_bytes
+
+
+def test_openai_speech_unexpected_error_is_500(mock_tts_service, test_voice):
+    mock_tts_service.generate_audio.side_effect = Exception("boom")
+    response = client.post(
+        "/v1/audio/speech",
+        json={"model": "kokoro", "input": "hi", "voice": test_voice, "stream": False},
+    )
+    assert response.status_code == 500
+    assert response.json()["detail"]["error"] == "processing_error"
+
+
+def test_openai_speech_streaming_over_pause_budget_is_400(mock_tts_service, test_voice):
+    """Over-budget requests must 400 before the stream opens, not die mid-200."""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "[pause:60s] " * 6,
+            "voice": test_voice,
+            "response_format": "mp3",
+            "stream": True,
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "validation_error"
+
+
+def test_openai_speech_streaming_nothing_speakable_is_400(
+    mock_tts_service, test_voice, monkeypatch
+):
+    """Blank input, or emoji-only with remove_emoji, 400s before the stream opens instead of an empty 200 (issue #353)."""
+    monkeypatch.setattr(settings, "unspoken_input_pause_s", 0)
+    for body in [
+        {"input": "   "},
+        {"input": "😊", "normalization_options": {"remove_emoji": True}},
+    ]:
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "kokoro",
+                "voice": test_voice,
+                "response_format": "mp3",
+                "stream": True,
+                **body,
+            },
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"]["error"] == "validation_error"
+
+
+def test_empty_input_with_alias_rate_is_400(mock_tts_service, test_voice, monkeypatch):
+    monkeypatch.setattr(settings, "unspoken_input_pause_s", 0.3)
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "",
+            "voice": "grandpa",
+            "allow_voice_tags": True,
+            "voice_aliases": {"grandpa": {"voice": test_voice, "rate": 0.8}},
+            "response_format": "mp3",
+            "stream": True,
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "validation_error"
+
+
+def test_openai_speech_streaming_null_normalization_options(
+    mock_tts_service, test_voice
+):
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "Hello world",
+            "voice": test_voice,
+            "response_format": "mp3",
+            "stream": True,
+            "normalization_options": None,
+        },
+    )
+    assert response.status_code == 200
+
+
+def test_captioned_streaming_over_pause_budget_is_400(mock_tts_service):
+    """The captioned handler carries the same pre-stream budget check."""
+    with patch(
+        "api.src.routers.development.process_and_validate_voices",
+        AsyncMock(return_value="test_voice"),
+    ):
+        response = client.post(
+            "/dev/captioned_speech",
+            json={
+                "model": "kokoro",
+                "input": "[pause:60s] " * 6,
+                "voice": "test_voice",
+                "response_format": "mp3",
+                "stream": True,
+            },
+        )
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "validation_error"
+
+
+def test_phonemize_empty_text_is_400():
+    """Bad input is the client's fault, not a server error."""
+    response = client.post("/dev/phonemize", json={"text": ""})
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "validation_error"
+
+
+def test_phonemize_returns_phonemes():
+    mock_pipeline = MagicMock(
+        return_value=iter([MagicMock(phonemes="hˈɛlO", tokens=[])])
+    )
+    with patch("api.src.routers.development.KPipeline", return_value=mock_pipeline):
+        response = client.post("/dev/phonemize", json={"text": "hello"})
+    assert response.status_code == 200
+    assert response.json()["phonemes"] == "hˈɛlO"
+
+
+def test_phonemize_returns_every_segment():
+    mock_pipeline = MagicMock(
+        return_value=iter(
+            [
+                MagicMock(phonemes="hˈɛlO", tokens=[]),
+                MagicMock(phonemes="wˈɜɹld", tokens=[]),
+            ]
+        )
+    )
+    with patch("api.src.routers.development.KPipeline", return_value=mock_pipeline):
+        response = client.post("/dev/phonemize", json={"text": "hello\n\nworld"})
+    assert response.status_code == 200
+    assert response.json()["phonemes"] == "hˈɛlO wˈɜɹld"
+
+
+def test_openai_speech_pcm_streaming(mock_tts_service, test_voice, mock_audio_bytes):
+    """Test PCM streaming format"""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "Hello world",
+            "voice": test_voice,
+            "response_format": "pcm",
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/pcm"
+
+    content = b""
+    for chunk in response.iter_bytes():
+        content += chunk
+    assert content == mock_audio_bytes
+
+
+def test_openai_speech_invalid_voice(mock_tts_service):
+    """Test error handling for invalid voice"""
+    mock_tts_service.generate_audio.side_effect = ValueError(
+        "Voice 'invalid_voice' not found"
+    )
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "Hello world",
+            "voice": "invalid_voice",
+            "response_format": "mp3",
+            "stream": False,
+        },
+    )
+    assert response.status_code == 400
+    error_response = response.json()
+    assert error_response["detail"]["error"] == "validation_error"
+    assert "Voice 'invalid_voice' not found" in error_response["detail"]["message"]
+    assert error_response["detail"]["type"] == "invalid_request_error"
+
+
+def test_openai_speech_empty_text(mock_tts_service, test_voice):
+    """Empty input is rejected before the service is called."""
+    mock_tts_service.list_voices.return_value = ["test_voice"]
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "",
+            "voice": test_voice,
+            "response_format": "mp3",
+            "stream": False,
+        },
+    )
+    assert response.status_code == 400
+    error_response = response.json()
+    assert error_response["detail"]["error"] == "validation_error"
+    assert "no speakable text" in error_response["detail"]["message"]
+    mock_tts_service.generate_audio.assert_not_called()
+    assert error_response["detail"]["type"] == "invalid_request_error"
+
+
+def test_openai_speech_invalid_format(mock_tts_service, test_voice):
+    """Test error handling for invalid format"""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "Hello world",
+            "voice": test_voice,
+            "response_format": "invalid_format",
+            "stream": False,
+        },
+    )
+    assert response.status_code == 422  # Validation error from Pydantic
+
+
+def test_list_voices(mock_tts_service):
+    """Test listing available voices"""
+    # Override the mock for this specific test
+    mock_tts_service.list_voices.return_value = ["voice1", "voice2"]
+
+    response = client.get("/v1/audio/voices")
+    assert response.status_code == 200
+    data = response.json()
+    assert "voices" in data
+    assert len(data["voices"]) == 2
+    assert {"id": "voice1", "name": "voice1"} in data["voices"]
+    assert {"id": "voice2", "name": "voice2"} in data["voices"]
+    assert data["default_voice"] == settings.default_voice
+
+    legacy = client.get("/v1/audio/voices?legacy=true")
+    assert legacy.status_code == 200
+    assert legacy.json() == {"voices": ["voice1", "voice2"]}
+
+
+def test_omitted_voice_uses_default_voice_setting(mock_tts_service):
+    """A request without a voice takes DEFAULT_VOICE, and the docs show it."""
+    mock_tts_service.list_voices.return_value = ["am_adam", settings.default_voice]
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={"input": "Hello world", "response_format": "mp3", "stream": False},
+    )
+    assert response.status_code == 200
+    voice = mock_tts_service.generate_audio.call_args[1]["voice"]
+    assert voice == settings.default_voice
+
+    schemas = client.get("/openapi.json").json()["components"]["schemas"]
+    for name in ("OpenAISpeechRequest", "CaptionedSpeechRequest"):
+        assert schemas[name]["properties"]["voice"]["default"] == settings.default_voice
+
+
+def test_list_voices_grades(mock_tts_service):
+    """Graded voices carry their model-card grades, ungraded ones stay bare"""
+    mock_tts_service.list_voices.return_value = ["af_bella", "ef_dora"]
+
+    data = client.get("/v1/audio/voices").json()
+    bella, dora = data["voices"]
+    assert bella == {
+        "id": "af_bella",
+        "name": "af_bella",
+        "target_quality": "A",
+        "training_duration": "HH hours",
+        "overall_grade": "A-",
+    }
+    assert dora == {"id": "ef_dora", "name": "ef_dora"}
+
+
+@patch("api.src.routers.openai_compatible.settings")
+def test_combine_voices(mock_settings, mock_tts_service, tmp_path):
+    """Test combining voices endpoint"""
+    # Enable local voice saving for this test
+    mock_settings.allow_local_voice_saving = True
+    pt_path = tmp_path / "voice1+voice2.pt"
+    pt_path.write_bytes(b"mock tensor")
+    mock_tts_service.get_voices_path.return_value = ("voice1+voice2", str(pt_path))
+
+    response = client.post("/v1/audio/voices/combine", json="voice1+voice2")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert 'filename="voice1_voice2.pt"' in response.headers["content-disposition"]
+    mock_tts_service.get_voices_path.assert_awaited_once_with("voice1+voice2")
+
+
+@patch("api.src.routers.openai_compatible.settings")
+def test_combine_voices_weighted(mock_settings, mock_tts_service, tmp_path):
+    """Weighted combine syntax is accepted, same grammar as the speech endpoints (#285)"""
+    mock_settings.allow_local_voice_saving = True
+    pt_path = tmp_path / "combined.pt"
+    pt_path.write_bytes(b"mock tensor")
+    mock_tts_service.get_voices_path.return_value = (
+        "voice1(2.2)+voice2(2.8)",
+        str(pt_path),
+    )
+
+    response = client.post("/v1/audio/voices/combine", json="voice1(2.2)+voice2(2.8)")
+    assert response.status_code == 200
+    assert (
+        'filename="voice1_2.2_voice2_2.8.pt"' in response.headers["content-disposition"]
+    )
+    mock_tts_service.get_voices_path.assert_awaited_once_with("voice1(2.2)+voice2(2.8)")
+
+
+@patch("api.src.routers.openai_compatible.settings")
+def test_combine_voices_list_input(mock_settings, mock_tts_service, tmp_path):
+    """List input joins into the same combine grammar"""
+    mock_settings.allow_local_voice_saving = True
+    pt_path = tmp_path / "voice1+voice2.pt"
+    pt_path.write_bytes(b"mock tensor")
+    mock_tts_service.get_voices_path.return_value = ("voice1+voice2", str(pt_path))
+
+    response = client.post("/v1/audio/voices/combine", json=["voice1", "voice2"])
+    assert response.status_code == 200
+    mock_tts_service.get_voices_path.assert_awaited_once_with("voice1+voice2")
+
+
+@patch("api.src.routers.openai_compatible.settings")
+def test_combine_voices_unknown_voice(mock_settings, mock_tts_service):
+    """Unknown voices in a combination 400 with the shared validation message"""
+    mock_settings.allow_local_voice_saving = True
+
+    response = client.post("/v1/audio/voices/combine", json="voice1+nonexistent")
+    assert response.status_code == 400
+    error_response = response.json()
+    assert error_response["detail"]["error"] == "validation_error"
+    assert "Voice 'nonexistent' not found" in error_response["detail"]["message"]
+
+
+@patch("api.src.routers.openai_compatible.settings")
+def test_combine_voices_disabled(mock_settings, mock_tts_service):
+    """Combine endpoint 403s when local voice saving is off"""
+    mock_settings.allow_local_voice_saving = False
+
+    response = client.post("/v1/audio/voices/combine", json="voice1+voice2")
+    assert response.status_code == 403
+    assert response.json()["detail"]["error"] == "permission_denied"
+
+
+def test_server_error(mock_tts_service, test_voice):
+    """Test handling of server errors"""
+
+    async def mock_error_stream(*args, **kwargs):
+        raise RuntimeError("Internal server error")
+
+    mock_tts_service.generate_audio = mock_error_stream
+    mock_tts_service.list_voices.return_value = ["test_voice"]
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "Hello world",
+            "voice": test_voice,
+            "response_format": "mp3",
+            "stream": False,
+        },
+    )
+    assert response.status_code == 500
+    error_response = response.json()
+    assert error_response["detail"]["error"] == "processing_error"
+    assert error_response["detail"]["type"] == "server_error"
+
+
+def test_streaming_error(mock_tts_service, test_voice):
+    """Test handling streaming errors"""
+    # Mock process_voices to raise the error
+    mock_tts_service.list_voices.side_effect = RuntimeError("Streaming failed")
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "Hello world",
+            "voice": test_voice,
+            "response_format": "mp3",
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 500
+    error_data = response.json()
+    assert error_data["detail"]["error"] == "processing_error"
+    assert error_data["detail"]["type"] == "server_error"
+    assert "Streaming failed" in error_data["detail"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_initialization_error():
+    """Test handling of streaming initialization errors"""
+    mock_service = AsyncMock()
+
+    async def mock_error_stream(*args, **kwargs):
+        if False:  # This makes it a proper generator
+            yield b""
+        raise RuntimeError("Failed to initialize stream")
+
+    mock_service.generate_audio_stream = mock_error_stream
+    mock_service.list_voices.return_value = ["test_voice"]
+
+    request = OpenAISpeechRequest(
+        model="kokoro",
+        input="Test text",
+        voice="test_voice",
+        response_format="mp3",
+        stream=True,
+        speed=1.0,
+    )
+
+    writer = StreamingAudioWriter("mp3", 24000)
+
+    with pytest.raises(RuntimeError) as exc:
+        async for _ in stream_audio_chunks(
+            mock_service, request, MagicMock(), writer, "test_voice"
+        ):
+            pass
+
+    writer.close()
+    assert "Failed to initialize stream" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "requested,expected",
+    [
+        (None, "tmprloey00i.mp3"),
+        ("", "tmprloey00i.mp3"),
+        (
+            "af_bella_2026-08-01T12-30-00-000Z.mp3",
+            "af_bella_2026-08-01T12-30-00-000Z.mp3",
+        ),
+        ("af_bella+af_sky", "af_bella_af_sky.mp3"),
+        ("report.wav", "report.mp3"),  # extension always comes from the stored file
+        ("../../etc/passwd", "etc_passwd.mp3"),
+        ("sub/dir/name", "sub_dir_name.mp3"),
+        ('bad";name', "bad_name.mp3"),
+        ("...", "tmprloey00i.mp3"),
+        ("x" * 200, f"{'x' * 100}.mp3"),
+    ],
+)
+def test_resolve_download_name(requested, expected):
+    """Client-supplied save-as names are sanitized and keep the stored extension"""
+    assert _resolve_download_name(requested, "tmprloey00i.mp3") == expected
+
+
+@pytest.fixture
+def temp_download_file(tmp_path):
+    """A stored temp audio file plus its patched temp dir"""
+    audio_file = tmp_path / "tmprloey00i.mp3"
+    audio_file.write_bytes(b"fake mp3 bytes")
+    with patch("api.src.routers.openai_compatible.settings") as mock_settings:
+        mock_settings.temp_file_dir = str(tmp_path)
+        yield audio_file
+
+
+def test_download_uses_temp_name_by_default(temp_download_file):
+    """Without ?name= the stored temp name is served"""
+    response = client.get("/v1/download/tmprloey00i.mp3")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/mpeg"
+    assert "tmprloey00i.mp3" in response.headers["content-disposition"]
+
+
+def test_download_honors_requested_name(temp_download_file):
+    """?name= drives Content-Disposition so the save dialog shows a friendly name"""
+    response = client.get(
+        "/v1/download/tmprloey00i.mp3",
+        params={"name": "af_bella_2026-08-01T12-30-00-000Z.mp3"},
+    )
+
+    assert response.status_code == 200
+    disposition = response.headers["content-disposition"]
+    assert "af_bella_2026-08-01T12-30-00-000Z.mp3" in disposition
+    assert "tmprloey00i" not in disposition
+
+
+def test_download_rejects_traversal_in_requested_name(temp_download_file):
+    """A path-like ?name= can't escape into a directory or swap the extension"""
+    response = client.get(
+        "/v1/download/tmprloey00i.mp3", params={"name": "../../evil.sh"}
+    )
+
+    assert response.status_code == 200
+    disposition = response.headers["content-disposition"]
+    assert "evil.mp3" in disposition
+    assert "/" not in disposition and ".." not in disposition
+
+
+def test_download_missing_file_returns_404(temp_download_file):
+    """Unknown temp names still 404"""
+    response = client.get("/v1/download/nope.mp3")
+
+    assert response.status_code == 404
+
+
+def test_dialogue_endpoint(mock_tts_service, mock_audio_bytes):
+    """Test the multi-speaker dialogue endpoint streams audio"""
+    response = client.post(
+        "/dev/dialogue",
+        json={
+            "model": "kokoro",
+            "turns": [
+                {"voice": "voice1", "text": "Hello there."},
+                {"voice": "voice2", "text": "Hi back."},
+            ],
+            "response_format": "mp3",
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/mpeg"
+    assert response.content == mock_audio_bytes
+
+
+def test_dialogue_endpoint_rejects_unknown_voice(mock_tts_service):
+    """An unknown turn voice fails validation before generation starts"""
+    response = client.post(
+        "/dev/dialogue",
+        json={
+            "turns": [{"voice": "not_a_voice", "text": "Hello."}],
+            "stream": False,
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "validation_error"
+
+
+def test_dialogue_endpoint_requires_turns(mock_tts_service):
+    """An empty turn list is a schema error"""
+    response = client.post("/dev/dialogue", json={"turns": []})
+    assert response.status_code == 422
+
+
+def test_dialogue_request_to_tagged_input():
+    """Turns render to the inline tag form the text pipeline consumes"""
+    from api.src.structures.schemas import DialogueRequest
+
+    request = DialogueRequest(
+        turns=[
+            {"voice": "af_bella", "text": "One."},
+            {"voice": "am_michael", "text": "Two."},
+        ],
+        pause_between_turns=0.5,
+    )
+    assert request.to_tagged_input() == (
+        "[voice:af_bella] One. [pause:0.5s] [voice:am_michael] Two."
+    )
+
+
+def test_dialogue_request_no_pause_between_turns():
+    """Zero pause joins turns with a plain space"""
+    from api.src.structures.schemas import DialogueRequest
+
+    request = DialogueRequest(
+        turns=[
+            {"voice": "af_bella", "text": "One."},
+            {"voice": "am_michael", "text": "Two."},
+        ],
+    )
+    assert request.to_tagged_input() == "[voice:af_bella] One. [voice:am_michael] Two."
+
+
+def test_dialogue_request_tiny_pause_never_renders_sci_notation():
+    """A sub-millisecond pause must not render as [pause:1e-05s] spoken text"""
+    from api.src.structures.schemas import DialogueRequest
+
+    request = DialogueRequest(
+        turns=[
+            {"voice": "af_bella", "text": "One."},
+            {"voice": "am_michael", "text": "Two."},
+        ],
+        pause_between_turns=1e-05,
+    )
+    assert request.to_tagged_input() == "[voice:af_bella] One. [voice:am_michael] Two."
+
+
+def test_dialogue_request_accepts_elevenlabs_field_names():
+    """inputs/voice_id are accepted as aliases for turns/voice"""
+    from api.src.structures.schemas import DialogueRequest
+
+    request = DialogueRequest.model_validate(
+        {
+            "inputs": [
+                {"voice_id": "af_bella", "text": "One."},
+                {"voice_id": "am_michael", "text": "Two."},
+            ]
+        }
+    )
+    assert [turn.voice for turn in request.turns] == ["af_bella", "am_michael"]
+    assert request.to_tagged_input() == "[voice:af_bella] One. [voice:am_michael] Two."
+
+
+def test_dialogue_endpoint_accepts_elevenlabs_field_names(mock_tts_service):
+    """The alias form reaches the endpoint, not just the model"""
+    response = client.post(
+        "/dev/dialogue",
+        json={
+            "inputs": [
+                {"voice_id": "voice1", "text": "One."},
+                {"voice_id": "voice2", "text": "Two."},
+            ],
+            "response_format": "mp3",
+            "stream": False,
+        },
+    )
+    assert response.status_code == 200
+
+
+def test_dialogue_endpoint_resolves_voice_aliases(mock_tts_service):
+    """The alias map applies to turn voices, first turn and tagged alike"""
+    response = client.post(
+        "/dev/dialogue",
+        json={
+            "turns": [
+                {"voice": "narrator", "text": "Hello there."},
+                {"voice": "voice2", "text": "Hi back."},
+            ],
+            "voice_aliases": {"narrator": "voice1"},
+            "stream": False,
+        },
+    )
+    assert response.status_code == 200
+
+
+def test_dialogue_turn_voice_cannot_smuggle_tag_syntax(mock_tts_service):
+    """A turn voice that would break out of its rendered [voice:...] tag is a 422"""
+    response = client.post(
+        "/dev/dialogue",
+        json={
+            "turns": [
+                {"voice": "voice1] [voice:voice2", "text": "Hello."},
+            ],
+            "stream": False,
+        },
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_process_and_validate_voice_tags_maps_openai_names(
+    mock_openai_mappings,
+):
+    """Inline tags get the same OpenAI voice mapping as the voice parameter"""
+    from api.src.routers.openai_compatible import process_and_validate_voice_tags
+
+    service = AsyncMock(spec=TTSService)
+    service.list_voices.return_value = ["am_adam", "bf_isabella"]
+
+    result = await process_and_validate_voice_tags(
+        "[voice:alloy] Hello. [voice:nova] Hi.", service, allow_voice_tags=True
+    )
+    assert result == "[voice:am_adam] Hello. [voice:bf_isabella] Hi."
+
+
+@pytest.mark.asyncio
+async def test_process_and_validate_voice_tags_rejects_unknown():
+    """An unknown inline voice raises rather than failing mid stream"""
+    from api.src.routers.openai_compatible import process_and_validate_voice_tags
+
+    service = AsyncMock(spec=TTSService)
+    service.list_voices.return_value = ["af_heart"]
+
+    with pytest.raises(ValueError, match="not found"):
+        await process_and_validate_voice_tags(
+            "[voice:nope] Hello.", service, allow_voice_tags=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_process_and_validate_voice_tags_passthrough():
+    """Untagged text is returned untouched without hitting the voice list"""
+    from api.src.routers.openai_compatible import process_and_validate_voice_tags
+
+    service = AsyncMock(spec=TTSService)
+    result = await process_and_validate_voice_tags("Plain text.", service)
+
+    assert result == "Plain text."
+    service.list_voices.assert_not_called()
+
+
+def test_speech_endpoint_with_inline_voice_tags(mock_tts_service, mock_audio_bytes):
+    """Inline voice tags are accepted on the standard speech endpoint"""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "[voice:voice1] Hello. [voice:voice2] Hi.",
+            "voice": "test_voice",
+            "response_format": "mp3",
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    assert response.content == mock_audio_bytes
+
+
+def test_speech_endpoint_rejects_unknown_inline_voice(mock_tts_service):
+    """A bad inline voice is a 400, not a mid stream failure"""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "[voice:not_a_voice] Hello.",
+            "voice": "test_voice",
+            "response_format": "mp3",
+            "stream": False,
+            "allow_voice_tags": True,
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "validation_error"
+
+
+def test_speech_endpoint_ignores_voice_tags_by_default(mock_tts_service):
+    """Bracketed text is spoken as written unless the request opts in"""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "He said [voice:not_a_voice] and left.",
+            "voice": "test_voice",
+            "response_format": "mp3",
+            "stream": False,
+        },
+    )
+    assert response.status_code == 200
+    kwargs = mock_tts_service.generate_audio.call_args.kwargs
+    assert kwargs["text"] == "He said [voice:not_a_voice] and left."
+    assert kwargs["allow_voice_tags"] is False
+
+
+def test_speech_endpoint_translates_ssml_input(mock_tts_service):
+    """ssml=true translates the markup before synthesis, no second call needed"""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": '<speak>Hi<break time="750ms"/>there</speak>',
+            "voice": "test_voice",
+            "response_format": "mp3",
+            "stream": False,
+            "allow_voice_tags": True,
+            "ssml": True,
+        },
+    )
+    assert response.status_code == 200
+    assert (
+        mock_tts_service.generate_audio.call_args.kwargs["text"]
+        == "Hi [pause:0.75s] there"
+    )
+
+
+def test_ssml_without_voice_tags_is_rejected(mock_tts_service):
+    """Translating without tag parsing would speak the emitted spans as written"""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "<speak>Hi there</speak>",
+            "voice": "test_voice",
+            "response_format": "mp3",
+            "stream": False,
+            "ssml": True,
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "validation_error"
+    mock_tts_service.generate_audio.assert_not_called()
+
+
+def test_malformed_ssml_on_the_speech_endpoint_is_a_400(mock_tts_service):
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "<speak>unclosed <voice>",
+            "voice": "test_voice",
+            "response_format": "mp3",
+            "stream": False,
+            "allow_voice_tags": True,
+            "ssml": True,
+        },
+    )
+    assert response.status_code == 400
+    mock_tts_service.generate_audio.assert_not_called()
+
+
+def test_ssml_kill_switch_403s_the_speech_endpoint(mock_tts_service, monkeypatch):
+    from api.src.core.config import settings
+
+    monkeypatch.setattr(settings, "enable_ssml", False)
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "<speak>Hi there</speak>",
+            "voice": "test_voice",
+            "response_format": "mp3",
+            "stream": False,
+            "allow_voice_tags": True,
+            "ssml": True,
+        },
+    )
+    assert response.status_code == 403
+    mock_tts_service.generate_audio.assert_not_called()
+
+
+def test_plain_text_is_untouched_when_ssml_is_off(mock_tts_service):
+    """The flag is opt-in, an unflagged request never reaches the translator"""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "<speak>Hi there</speak>",
+            "voice": "test_voice",
+            "response_format": "mp3",
+            "stream": False,
+        },
+    )
+    assert response.status_code == 200
+    assert (
+        mock_tts_service.generate_audio.call_args.kwargs["text"]
+        == "<speak>Hi there</speak>"
+    )
+
+
+def test_captioned_endpoint_translates_ssml_input(mock_tts_service):
+    """ssml=true translates before the timestamped stream opens"""
+    seen = {}
+
+    async def fake_stream(tts_service, request, *args, **kwargs):
+        seen["text"] = request.input
+        return
+        yield
+
+    with (
+        patch("api.src.routers.development.stream_audio_chunks", fake_stream),
+        patch(
+            "api.src.routers.development.process_and_validate_voices",
+            AsyncMock(return_value="test_voice"),
+        ),
+    ):
+        response = client.post(
+            "/dev/captioned_speech",
+            json={
+                "model": "kokoro",
+                "input": '<speak>Hi<break time="750ms"/>there</speak>',
+                "voice": "test_voice",
+                "response_format": "mp3",
+                "allow_voice_tags": True,
+                "ssml": True,
+            },
+        )
+    assert response.status_code == 200
+    assert seen["text"] == "Hi [pause:0.75s] there"
+
+
+def test_captioned_ssml_without_voice_tags_is_rejected():
+    """Same guard as the speech endpoint, the spans would be read aloud"""
+    response = client.post(
+        "/dev/captioned_speech",
+        json={
+            "model": "kokoro",
+            "input": "<speak>Hi there</speak>",
+            "voice": "test_voice",
+            "ssml": True,
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "validation_error"
+
+
+def test_malformed_ssml_on_the_captioned_endpoint_is_a_400():
+    response = client.post(
+        "/dev/captioned_speech",
+        json={
+            "model": "kokoro",
+            "input": "<speak>unclosed <voice>",
+            "voice": "test_voice",
+            "allow_voice_tags": True,
+            "ssml": True,
+        },
+    )
+    assert response.status_code == 400
+
+
+def test_ssml_kill_switch_403s_the_captioned_endpoint(monkeypatch):
+    monkeypatch.setattr(settings, "enable_ssml", False)
+    response = client.post(
+        "/dev/captioned_speech",
+        json={
+            "model": "kokoro",
+            "input": "<speak>Hi there</speak>",
+            "voice": "test_voice",
+            "allow_voice_tags": True,
+            "ssml": True,
+        },
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_voice_aliases_stand_in_for_a_mix_in_tags():
+    """A short name keeps the mix out of the text without changing what is spoken"""
+    from api.src.routers.openai_compatible import process_and_validate_voice_tags
+
+    service = AsyncMock(spec=TTSService)
+    service.list_voices.return_value = ["af_bella", "af_sky", "am_michael"]
+
+    result = await process_and_validate_voice_tags(
+        "[voice:narrator] Once. [voice:villain] Never.",
+        service,
+        allow_voice_tags=True,
+        aliases={"narrator": "af_bella(2)+af_sky", "villain": "am_michael"},
+    )
+    assert result == "[voice:af_bella(2)+af_sky] Once. [voice:am_michael] Never."
+
+
+@pytest.mark.asyncio
+async def test_voice_alias_pointing_at_an_unknown_voice_still_fails():
+    """Aliases are a naming layer, not a way around validation"""
+    from api.src.routers.openai_compatible import process_and_validate_voice_tags
+
+    service = AsyncMock(spec=TTSService)
+    service.list_voices.return_value = ["af_heart"]
+
+    with pytest.raises(ValueError, match="not found"):
+        await process_and_validate_voice_tags(
+            "[voice:narrator] Hello.",
+            service,
+            allow_voice_tags=True,
+            aliases={"narrator": "af_nope"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_unaliased_names_are_left_to_normal_validation():
+    """A tag with no alias behaves exactly as it did before aliases existed"""
+    from api.src.routers.openai_compatible import process_and_validate_voice_tags
+
+    service = AsyncMock(spec=TTSService)
+    service.list_voices.return_value = ["af_heart", "am_michael"]
+
+    result = await process_and_validate_voice_tags(
+        "[voice:af_heart] One. [voice:narrator] Two.",
+        service,
+        allow_voice_tags=True,
+        aliases={"narrator": "am_michael"},
+    )
+    assert result == "[voice:af_heart] One. [voice:am_michael] Two."
+
+
+@pytest.mark.asyncio
+async def test_alias_names_are_matched_regardless_of_case():
+    """The tag pattern is case-insensitive, so a capitalised name has to find its alias"""
+    from api.src.routers.openai_compatible import process_and_validate_voice_tags
+
+    service = AsyncMock(spec=TTSService)
+    service.list_voices.return_value = ["af_bella", "am_michael"]
+
+    result = await process_and_validate_voice_tags(
+        "[voice:Narrator] One. [voice:VILLAIN] Two.",
+        service,
+        allow_voice_tags=True,
+        aliases={"narrator": "af_bella", "villain": "am_michael"},
+    )
+    assert result == "[voice:af_bella] One. [voice:am_michael] Two."
+
+
+@pytest.mark.asyncio
+async def test_an_exactly_spelled_alias_wins_over_a_folded_one():
+    """Two names differing only in case stay distinct rather than collapsing by map order"""
+    from api.src.routers.openai_compatible import resolve_voice_alias
+
+    aliases = {"Bob": "af_bella", "bob": "am_michael"}
+    assert resolve_voice_alias("bob", aliases) == "am_michael"
+    assert resolve_voice_alias("Bob", aliases) == "af_bella"
+
+
+@pytest.mark.asyncio
+async def test_voice_alias_applies_to_the_voice_parameter():
+    """The default speaker can be named too, since it is just another cast member"""
+    from api.src.routers.openai_compatible import process_and_validate_voices
+
+    service = AsyncMock(spec=TTSService)
+    service.list_voices.return_value = ["af_bella", "af_sky"]
+
+    resolved = await process_and_validate_voices(
+        "narrator", service, {"narrator": "af_bella(2)+af_sky"}
+    )
+    assert resolved == "af_bella(2)+af_sky"
+
+
+@pytest.mark.asyncio
+async def test_malformed_voice_weights_are_rejected_up_front():
+    """Weight syntax errors fail validation instead of dying mid-stream"""
+    from api.src.routers.openai_compatible import process_and_validate_voices
+
+    service = AsyncMock(spec=TTSService)
+    service.list_voices.return_value = ["af_bella", "af_sky"]
+
+    for bad in [
+        "af_bella(",
+        "af_bella)",
+        "af_bella(2",
+        "af_bella2)",
+        "af_bella(2))",
+        "af_bella()",
+        "af_bella(abc)",
+        "af_bella(nan)",
+        "af_bella(0)+af_sky(0)",
+    ]:
+        with pytest.raises(ValueError):
+            await process_and_validate_voices(bad, service)
+
+
+@pytest.mark.asyncio
+async def test_weighted_combinations_pass_validation():
+    """The full weight grammar still round-trips untouched"""
+    from api.src.routers.openai_compatible import process_and_validate_voices
+
+    service = AsyncMock(spec=TTSService)
+    service.list_voices.return_value = ["af_bella", "af_sky"]
+
+    resolved = await process_and_validate_voices("af_bella(2)+af_sky(0.5)", service)
+    assert resolved == "af_bella(2)+af_sky(0.5)"
+
+    resolved = await process_and_validate_voices("af_bella-af_sky(.5)", service)
+    assert resolved == "af_bella-af_sky(.5)"
+
+
+@pytest.mark.asyncio
+async def test_tag_validation_scans_the_voice_dir_once():
+    """One list_voices call covers every tag in the request"""
+    from api.src.routers.openai_compatible import process_and_validate_voice_tags
+
+    service = AsyncMock(spec=TTSService)
+    service.list_voices.return_value = ["af_bella", "am_michael"]
+
+    await process_and_validate_voice_tags(
+        "[voice:af_bella] a [voice:am_michael] b [voice:af_bella] c",
+        service,
+        allow_voice_tags=True,
+    )
+    assert service.list_voices.await_count == 1
+
+
+def test_speech_endpoint_rejects_tag_breaking_alias_values(mock_tts_service):
+    """An alias value that cannot appear inside [voice:...] is a 422 at parse time"""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "[voice:narrator] Hello.",
+            "voice": "voice1",
+            "response_format": "mp3",
+            "stream": False,
+            "allow_voice_tags": True,
+            "voice_aliases": {"narrator": "af_bella(2])"},
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_speech_endpoint_accepts_voice_aliases(mock_tts_service, mock_audio_bytes):
+    """The alias map travels with the request, so the payload is self contained"""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "[voice:narrator] Hello. [voice:villain] Never.",
+            "voice": "narrator",
+            "response_format": "mp3",
+            "stream": False,
+            "allow_voice_tags": True,
+            "voice_aliases": {"narrator": "voice1", "villain": "voice2"},
+        },
+    )
+    assert response.status_code == 200
+    kwargs = mock_tts_service.generate_audio.call_args.kwargs
+    assert kwargs["text"] == "[voice:voice1] Hello. [voice:voice2] Never."
+    assert kwargs["voice"] == "voice1"
+
+
+def test_speech_endpoint_rejects_an_alias_to_nowhere(mock_tts_service):
+    """A mistyped alias target is a 400 like any other unknown voice"""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "[voice:narrator] Hello.",
+            "voice": "voice1",
+            "response_format": "mp3",
+            "stream": False,
+            "allow_voice_tags": True,
+            "voice_aliases": {"narrator": "not_a_voice"},
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "validation_error"
+
+
+def test_speech_endpoint_rejects_an_alias_to_an_empty_target(mock_tts_service):
+    """An alias resolving to an empty string is rejected at parse time, not an IndexError"""
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "Hello.",
+            "voice": "narrator",
+            "response_format": "mp3",
+            "stream": False,
+            "voice_aliases": {"narrator": ""},
+        },
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_process_and_validate_voice_tags_disabled_skips_validation():
+    """With tags off the text is untouched and the voice list is never read"""
+    from api.src.routers.openai_compatible import process_and_validate_voice_tags
+
+    service = AsyncMock(spec=TTSService)
+    result = await process_and_validate_voice_tags("[voice:nope] Hello.", service)
+
+    assert result == "[voice:nope] Hello."
+    service.list_voices.assert_not_called()
+
+
+def test_dialogue_endpoint_opts_into_voice_tags(mock_tts_service):
+    """/dev/dialogue builds its own tags, so it opts in on the caller's behalf"""
+    response = client.post(
+        "/dev/dialogue",
+        json={
+            "turns": [
+                {"voice": "voice1", "text": "One."},
+                {"voice": "voice2", "text": "Two."},
+            ],
+            "response_format": "mp3",
+            "stream": False,
+        },
+    )
+    assert response.status_code == 200
+    assert mock_tts_service.generate_audio.call_args.kwargs["allow_voice_tags"] is True
+
+
+@pytest.mark.parametrize("text", ["", "   "])
+def test_dialogue_endpoint_rejects_blank_turn_text(mock_tts_service, text):
+    """A blank turn is a schema error rather than a failure deep in generation"""
+    response = client.post(
+        "/dev/dialogue",
+        json={"turns": [{"voice": "voice1", "text": text}]},
+    )
+    assert response.status_code == 422
+
+
+def test_speech_endpoint_403_when_voice_tags_disabled(mock_tts_service, monkeypatch):
+    """The server kill switch refuses the opt in outright"""
+    monkeypatch.setattr(settings, "enable_voice_tags", False)
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "[voice:voice1] Hello.",
+            "voice": "voice1",
+            "stream": False,
+            "allow_voice_tags": True,
+        },
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["error"] == "permission_denied"
+
+
+def test_speech_endpoint_without_opt_in_ignores_kill_switch(
+    mock_tts_service, monkeypatch
+):
+    """Plain requests are untouched by the flag either way"""
+    monkeypatch.setattr(settings, "enable_voice_tags", False)
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "kokoro",
+            "input": "Hello.",
+            "voice": "voice1",
+            "response_format": "wav",
+            "stream": False,
+        },
+    )
+    assert response.status_code == 200
+
+
+def test_dialogue_endpoint_403_when_voice_tags_disabled(monkeypatch):
+    """/dev/dialogue is tags end to end, so the flag turns the endpoint off"""
+    monkeypatch.setattr(settings, "enable_voice_tags", False)
+    response = client.post(
+        "/dev/dialogue",
+        json={"turns": [{"voice": "voice1", "text": "One."}]},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["error"] == "permission_denied"
+
+
+def test_captioned_endpoint_403_when_voice_tags_disabled(monkeypatch):
+    """The captioned opt in answers to the same kill switch"""
+    monkeypatch.setattr(settings, "enable_voice_tags", False)
+    response = client.post(
+        "/dev/captioned_speech",
+        json={
+            "model": "kokoro",
+            "input": "[voice:voice1] Hello.",
+            "voice": "voice1",
+            "allow_voice_tags": True,
+        },
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["error"] == "permission_denied"
+
+
+def test_streaming_with_timing_sidecar(
+    mock_tts_service, test_voice, mock_audio_bytes, tmp_path
+):
+    """return_timing + return_download_link produces X-Timing-Path and writes a sidecar"""
+    mock_cfg = MagicMock()
+    mock_cfg.temp_file_dir = str(tmp_path)
+    mock_cfg.enable_voice_tags = True
+    mock_cfg.max_temp_dir_count = 100
+    mock_cfg.max_temp_dir_size_mb = 100
+    mock_cfg.max_temp_dir_age_hours = 1
+
+    with (
+        patch("api.src.routers.openai_compatible.settings", mock_cfg),
+        patch("api.src.services.temp_manager.settings", mock_cfg),
+    ):
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "kokoro",
+                "input": "Hello world",
+                "voice": test_voice,
+                "response_format": "mp3",
+                "stream": True,
+                "return_download_link": True,
+                "return_timing": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert "X-Timing-Path" in response.headers
+    timing_path = response.headers["X-Timing-Path"]
+    assert timing_path.endswith(".json")
+
+    download_path = response.headers.get("X-Download-Path", "")
+    assert timing_path == f"{download_path}.json"
+
+    sidecar_file = tmp_path / os.path.basename(timing_path)
+    assert sidecar_file.exists(), (
+        "timing sidecar file should be written after stream completes"
+    )
+    sidecar = json.loads(sidecar_file.read_text())
+    assert "chunks" in sidecar
+
+
+def test_streaming_without_timing_has_no_header(
+    mock_tts_service, test_voice, mock_audio_bytes, tmp_path
+):
+    """Without return_timing the header is absent"""
+    mock_cfg = MagicMock()
+    mock_cfg.temp_file_dir = str(tmp_path)
+    mock_cfg.enable_voice_tags = True
+    mock_cfg.max_temp_dir_count = 100
+    mock_cfg.max_temp_dir_size_mb = 100
+    mock_cfg.max_temp_dir_age_hours = 1
+
+    with (
+        patch("api.src.routers.openai_compatible.settings", mock_cfg),
+        patch("api.src.services.temp_manager.settings", mock_cfg),
+    ):
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "kokoro",
+                "input": "Hello world",
+                "voice": test_voice,
+                "response_format": "mp3",
+                "stream": True,
+                "return_download_link": True,
+                "return_timing": False,
+            },
+        )
+
+    assert response.status_code == 200
+    assert "X-Timing-Path" not in response.headers
+
+
+def test_word_timestamp_omits_voice_when_unset():
+    """Captioned responses stay byte-identical for callers not using voice tags"""
+    from api.src.structures.schemas import WordTimestamp
+
+    plain = WordTimestamp(word="hi", start_time=0.0, end_time=0.1).model_dump()
+    tagged = WordTimestamp(
+        word="hi", start_time=0.0, end_time=0.1, voice="af_bella"
+    ).model_dump()
+
+    assert "voice" not in plain
+    assert tagged["voice"] == "af_bella"
+
+
+def test_dev_ssml_translates_with_voice():
+    """A given voice enables control-tag emission with reverts."""
+    response = client.post(
+        "/dev/ssml",
+        json={
+            "text": '<speak>one <voice name="am_michael">two</voice> <prosody rate="slow">three</prosody></speak>',
+            "voice": "af_bella",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["text"] == (
+        "one [voice:am_michael] two [voice:af_bella] [rate:0.75] three [rate:1.0]"
+    )
+
+
+def test_dev_ssml_strips_controls_without_voice():
+    """No voice means voice/prosody are stripped and only content remains."""
+    response = client.post(
+        "/dev/ssml",
+        json={
+            "text": '<speak>one <voice name="am_michael">two</voice><break time="1s"/>three</speak>'
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["text"] == "one two [pause:1.0s] three"
+
+
+def test_dev_ssml_capabilities_lists_supported_and_ignored():
+    """The published surface is read off the translator's own table."""
+    body = client.get("/dev/ssml").json()
+
+    assert body["elements"]["break"]
+    assert "emphasis" in body["ignored"]
+    assert set(body["elements"]).isdisjoint(body["ignored"])
+    assert body["rate_range"] == [0.25, 4.0]
+    assert body["break_strengths"]["strong"] == 1.0
+
+
+def test_dev_ssml_malformed_returns_400():
+    response = client.post(
+        "/dev/ssml", json={"text": "<speak>unclosed <voice>", "voice": "af_bella"}
+    )
+    assert response.status_code == 400
+    assert "Malformed SSML" in response.json()["detail"]["message"]
+
+
+def test_dev_ssml_non_ssml_passes_through():
+    response = client.post("/dev/ssml", json={"text": "plain [pause:1s] text"})
+    assert response.status_code == 200
+    assert response.json()["text"] == "plain [pause:1s] text"
+
+
+@pytest.mark.asyncio
+async def test_alias_rate_expands_to_a_baserate_tag():
+    """A rate-carrying alias speaks at its own pace, and an uncalibrated one at 1.0
+
+    The voice tag itself resets the pace, so grandpa's cannot follow him into
+    the kid's lines. That reset is the whole point of calibrating a voice.
+    """
+    from api.src.routers.openai_compatible import process_and_validate_voice_tags
+    from api.src.services.text_processing.text_processor import split_by_voice
+    from api.src.structures.schemas import VoiceAlias
+
+    service = AsyncMock(spec=TTSService)
+    service.list_voices.return_value = ["af_bella", "am_michael"]
+
+    result = await process_and_validate_voice_tags(
+        "[voice:grandpa] Hi. [voice:kid] Yo.",
+        service,
+        allow_voice_tags=True,
+        aliases={
+            "grandpa": VoiceAlias(voice="am_michael", rate=0.8),
+            "kid": "af_bella",
+        },
+    )
+    assert result == "[voice:am_michael] [baserate:0.8] Hi. [voice:af_bella] Yo."
+
+    segments = split_by_voice(result, "af_bella")
+    assert segments == [
+        ("am_michael", 0.8, "Hi."),
+        ("af_bella", 1.0, "Yo."),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rate_tag_scales_the_alias_base_rate():
+    """An explicit rate is relative to the voice's calibrated pace, not absolute"""
+    from api.src.routers.openai_compatible import process_and_validate_voice_tags
+    from api.src.services.text_processing.text_processor import split_by_voice
+    from api.src.structures.schemas import VoiceAlias
+
+    service = AsyncMock(spec=TTSService)
+    service.list_voices.return_value = ["af_bella"]
+
+    result = await process_and_validate_voice_tags(
+        "[voice:kore] Calibrated. [rate:1.5] Faster, still hers.",
+        service,
+        allow_voice_tags=True,
+        aliases={"kore": VoiceAlias(voice="af_bella", rate=0.5)},
+    )
+    segments = split_by_voice(result, "af_bella")
+    assert segments == [
+        ("af_bella", 0.5, "Calibrated."),
+        ("af_bella", 0.75, "Faster, still hers."),
+    ]
+
+
+def test_alias_rate_on_voice_param_multiplies_speed_when_tags_off():
+    from api.src.routers.openai_compatible import apply_alias_rate
+
+    request = OpenAISpeechRequest(
+        input="Hello.",
+        voice="grandpa",
+        speed=2.0,
+        voice_aliases={"grandpa": {"voice": "am_michael", "rate": 0.8}},
+    )
+    apply_alias_rate(request)
+    assert request.speed == 1.6
+    assert request.input == "Hello."
+
+
+def test_alias_rate_on_voice_param_opens_a_baserate_tag_when_tags_on():
+    """As the opening tag it sets the base pace that later rate tags scale"""
+    from api.src.routers.openai_compatible import apply_alias_rate
+
+    request = OpenAISpeechRequest(
+        input="Hello.",
+        voice="grandpa",
+        speed=2.0,
+        allow_voice_tags=True,
+        voice_aliases={"grandpa": {"voice": "am_michael", "rate": 0.8}},
+    )
+    apply_alias_rate(request)
+    assert request.speed == 2.0
+    assert request.input == "[baserate:0.8] Hello."
+
+
+def test_alias_rate_outside_speed_bounds_rejected():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        OpenAISpeechRequest(
+            input="Hello.",
+            voice="grandpa",
+            voice_aliases={"grandpa": {"voice": "am_michael", "rate": 9}},
+        )

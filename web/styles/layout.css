@@ -1,0 +1,115 @@
+body {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    height: 100dvh;
+    overflow: hidden;
+}
+
+.app-shell {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) clamp(320px, 25vw, 460px);
+    gap: 1rem;
+    width: 100%;
+    max-width: 2200px;
+    margin: 0 auto;
+    padding: 1rem clamp(1rem, 2vw, 2rem);
+    min-height: 0;
+    position: relative;
+    z-index: 1;
+}
+
+.editor-pane {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+}
+
+#text-editor {
+    flex: 1;
+    display: flex;
+    min-width: 0;
+    min-height: 0;
+}
+
+.side-pane {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow-y: auto;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(99, 102, 241, 0.2) transparent;
+}
+
+.side-pane > section {
+    padding: 0.35rem 0.85rem;
+}
+
+/* voices card absorbs leftover height so the pane meets the editor's bottom edge */
+.side-pane > .voice-card {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: min-content;
+}
+
+/* fixed-height cards: a status message borrows height from the voice list, not these */
+.side-pane > .settings-card,
+.side-pane > .generate-card {
+    flex-shrink: 0;
+}
+
+/* keep generate reachable even when the pane has to scroll */
+.side-pane > .generate-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    position: sticky;
+    bottom: 0;
+    background: rgba(30, 41, 59, 0.92);
+    backdrop-filter: blur(8px);
+}
+
+.side-pane > section + section {
+    border-top: 1px solid var(--border);
+}
+
+.side-pane > .voice-card + section {
+    border-top: none;
+}
+
+.side-pane::-webkit-scrollbar {
+    width: 6px;
+}
+
+.side-pane::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.side-pane::-webkit-scrollbar-thumb {
+    background-color: rgba(99, 102, 241, 0.2);
+    border-radius: 3px;
+}
+
+@media (max-width: 900px) {
+    body {
+        display: flex;
+        flex-direction: column;
+        height: auto;
+        min-height: 100dvh;
+        overflow: visible;
+    }
+
+    .app-shell {
+        grid-template-columns: 1fr;
+        padding: 0.75rem;
+        gap: 0.75rem;
+    }
+
+    .side-pane {
+        overflow: visible;
+    }
+}

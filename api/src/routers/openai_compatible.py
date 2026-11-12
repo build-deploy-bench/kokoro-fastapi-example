@@ -1,0 +1,832 @@
+"""OpenAI-compatible router for text-to-speech"""
+
+import json
+import math
+import os
+import re
+from contextlib import aclosing
+from typing import AsyncGenerator, Dict, List, Optional, Union
+
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse, StreamingResponse
+from loguru import logger
+
+from ..core.config import settings
+from ..inference.base import AudioChunk
+from ..inference.voice_manager import get_manager as get_voice_manager
+from ..services.streaming_audio_writer import StreamingAudioWriter
+from ..services.text_processing.text_processor import (
+    VOICE_TAG_PATTERN,
+    check_pause_budget,
+    check_speakable,
+)
+from ..services.tts_service import TTSService
+from ..structures import OpenAISpeechRequest
+from ..structures.schemas import (
+    AliasMap,
+    CaptionedSpeechRequest,
+    VoiceAlias,
+    clamp_rate,
+)
+from .ssml import apply_ssml
+
+
+def _load_core_json(filename: str, default: Dict) -> Dict:
+    api_dir = os.path.dirname(os.path.dirname(__file__))
+    path = os.path.join(api_dir, "core", filename)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to load {filename}: {e}")
+        return default
+
+
+def load_openai_mappings() -> Dict:
+    """Load OpenAI voice and model mappings from JSON"""
+    return _load_core_json("openai_mappings.json", {"models": {}, "voices": {}})
+
+
+def load_voice_grades() -> Dict:
+    """Load per-voice grades from https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md"""
+    return _load_core_json("voice_grades.json", {})
+
+
+_openai_mappings = load_openai_mappings()
+_voice_grades = load_voice_grades()
+
+# a combine item is a bare voice name or name(weight), parens never nest
+_VOICE_WEIGHT_PATTERN = re.compile(r"(?P<name>[^()]+)(?:\((?P<weight>[^()]*)\))?")
+
+router = APIRouter(
+    tags=["OpenAI Compatible TTS"],
+    responses={404: {"description": "Not found"}},
+)
+
+# Global TTSService instance with lock
+_tts_service = None
+_init_lock = None
+
+
+async def get_tts_service() -> TTSService:
+    """Get global TTSService instance"""
+    global _tts_service, _init_lock
+
+    # Create lock if needed
+    if _init_lock is None:
+        import asyncio
+
+        _init_lock = asyncio.Lock()
+
+    # Initialize service if needed
+    if _tts_service is None:
+        async with _init_lock:
+            # Double check pattern
+            if _tts_service is None:
+                _tts_service = await TTSService.create()
+                logger.info("Created global TTSService instance")
+
+    return _tts_service
+
+
+def get_model_name(model: str) -> str:
+    """Get internal model name from OpenAI model name"""
+    base_name = _openai_mappings["models"].get(model)
+    if not base_name:
+        raise ValueError(f"Unsupported model: {model}")
+    return base_name + ".pth"
+
+
+def _alias_target(
+    voice: str, aliases: Optional[AliasMap]
+) -> Optional[Union[str, VoiceAlias]]:
+    """Look up the alias entry for a name, case-insensitively, None when unaliased.
+
+    Matching is case-insensitive, since VOICE_TAG_PATTERN already is: a tag written
+    [voice:Narrator] has to reach the same alias as [voice:narrator].
+    """
+    if not aliases:
+        return None
+
+    name = str(voice).strip()
+    if name in aliases:
+        return aliases[name]
+
+    folded = name.casefold()
+    for alias, target in aliases.items():
+        if str(alias).strip().casefold() == folded:
+            return target
+    return None
+
+
+def resolve_voice_alias(voice: str, aliases: Optional[AliasMap] = None) -> str:
+    """Swap a request-scoped short name for the mix it stands for, leaving anything else alone."""
+    target = _alias_target(voice, aliases)
+    if target is None:
+        return voice
+    return target if isinstance(target, str) else target.voice
+
+
+def alias_rate(voice: str, aliases: Optional[AliasMap] = None) -> Optional[float]:
+    """The rate a VoiceAlias target carries for this name, if any."""
+    target = _alias_target(voice, aliases)
+    return None if target is None or isinstance(target, str) else target.rate
+
+
+async def process_and_validate_voices(
+    voice_input: str,
+    tts_service: TTSService,
+    aliases: Optional[AliasMap] = None,
+    available_voices: Optional[List[str]] = None,
+) -> str:
+    """Process a voice string, resolving any alias and validating every voice in the combination
+
+    Returns:
+        Voice name to use (with weights if specified)
+    """
+    voice_input = resolve_voice_alias(voice_input, aliases)
+    voice_input = voice_input.replace(" ", "").strip()
+
+    if not voice_input:
+        raise ValueError("Voice name cannot be empty")
+
+    if voice_input[-1] in "+-" or voice_input[0] in "+-":
+        raise ValueError("Voice combination contains empty combine items")
+
+    if re.search(r"[+-]{2,}", voice_input) is not None:
+        raise ValueError("Voice combination contains empty combine items")
+
+    # separators are kept, so the loop below steps past them to the voices
+    voices = re.split(r"([-+])", voice_input)
+
+    if available_voices is None:
+        available_voices = await tts_service.list_voices()
+    voice_manager = await get_voice_manager()
+
+    for voice_index in range(0, len(voices), 2):
+        token = voices[voice_index]
+        match = _VOICE_WEIGHT_PATTERN.fullmatch(token)
+        if not match:
+            raise ValueError(f"Voice '{token}' is not a valid voice or voice(weight)")
+
+        name = match.group("name").strip()
+        weight = match.group("weight")
+        if weight is not None:
+            try:
+                parsed = float(weight)
+            except ValueError:
+                parsed = math.nan
+            if not math.isfinite(parsed) or parsed <= 0:
+                raise ValueError(f"Voice '{token}' must use a positive weight")
+            weight = weight.strip()
+
+        name = _openai_mappings["voices"].get(name, name)
+        if name not in available_voices and not voice_manager.is_transient(name):
+            raise ValueError(
+                f"Voice '{name}' not found. Available voices: {', '.join(sorted(available_voices))}"
+            )
+
+        voices[voice_index] = name if weight is None else f"{name}({weight})"
+
+    return "".join(voices)
+
+
+def require_voice_tags_enabled() -> None:
+    """403 when the server-level voice tag kill switch is off"""
+    if not settings.enable_voice_tags:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "permission_denied",
+                "message": "Voice tags are disabled on this server",
+                "type": "permission_error",
+            },
+        )
+
+
+async def process_and_validate_voice_tags(
+    text: str,
+    tts_service: TTSService,
+    allow_voice_tags: bool = False,
+    aliases: Optional[AliasMap] = None,
+) -> str:
+    """Validate inline [voice:...] tags, rewriting them to resolved voice names.
+
+    Runs the same mapping and validation as the voice parameter so a bad speaker
+    tag fails the request up front rather than part way through the stream.
+    A rate-carrying alias expands to a [baserate:] tag alongside the voice, the
+    calibrated pace later [rate:] tags scale instead of overwrite; a voice tag
+    itself resets both rates, so a pace belongs to the voice that was calibrated
+    with it and cannot carry across a voice change onto one that was not.
+    """
+    if not allow_voice_tags:
+        return text
+
+    tags = VOICE_TAG_PATTERN.findall(text)
+    if not tags:
+        return text
+
+    available_voices = await tts_service.list_voices()
+    resolved = {}
+    for tag in dict.fromkeys(tags):
+        name = await process_and_validate_voices(
+            tag, tts_service, aliases, available_voices
+        )
+        rate = alias_rate(tag, aliases)
+        resolved[tag] = (
+            f"[voice:{name}] [baserate:{rate}]" if rate else f"[voice:{name}]"
+        )
+    return VOICE_TAG_PATTERN.sub(lambda m: resolved[m.group(1)], text)
+
+
+def apply_alias_rate(
+    request: Union[OpenAISpeechRequest, CaptionedSpeechRequest],
+) -> None:
+    """Fold the request voice's alias rate in, when it has one.
+
+    With voice tags on it becomes the opening [baserate:] tag that later
+    [rate:] tags scale; with tags off there is no tag pass, so it multiplies
+    speed.
+    """
+    rate = alias_rate(request.voice, request.voice_aliases)
+    if not rate or not request.input:
+        return
+    if request.allow_voice_tags:
+        request.input = f"[baserate:{rate}] {request.input}"
+    else:
+        request.speed = clamp_rate(request.speed * rate)
+
+
+async def stream_audio_chunks(
+    tts_service: TTSService,
+    request: Union[OpenAISpeechRequest, CaptionedSpeechRequest],
+    client_request: Request,
+    writer: StreamingAudioWriter,
+    voice_name: str,
+    timings: Optional[list] = None,
+) -> AsyncGenerator[AudioChunk, None]:
+    """Stream audio chunks as they're generated with client disconnect handling"""
+    assert isinstance(voice_name, str) and voice_name, "voice_name skipped validation"
+    return_timestamps = getattr(request, "return_timestamps", False)
+
+    try:
+        async with aclosing(
+            tts_service.generate_audio_stream(
+                text=request.input,
+                voice=voice_name,
+                writer=writer,
+                speed=request.speed,
+                output_format=request.response_format,
+                lang_code=request.lang_code,
+                volume_multiplier=request.volume_multiplier,
+                normalization_options=request.normalization_options,
+                return_timestamps=return_timestamps,
+                allow_voice_tags=request.allow_voice_tags,
+                timings=timings,
+            )
+        ) as audio_stream:
+            async for chunk_data in audio_stream:
+                # Check if client is still connected
+                is_disconnected = client_request.is_disconnected
+                if callable(is_disconnected):
+                    is_disconnected = await is_disconnected()
+                if is_disconnected:
+                    logger.info("Client disconnected, stopping audio generation")
+                    break
+
+                yield chunk_data
+    except Exception as e:
+        logger.error(f"Error in audio streaming: {str(e)}")
+        # Let the exception propagate to trigger cleanup
+        raise
+
+
+@router.post("/audio/speech")
+async def create_speech(
+    request: OpenAISpeechRequest,
+    client_request: Request,
+    x_raw_response: Optional[str] = Header(None, alias="x-raw-response"),
+):
+    """OpenAI-compatible endpoint for text-to-speech"""
+    # Validate model before processing request
+    if request.model not in _openai_mappings["models"]:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_model",
+                "message": f"Unsupported model: {request.model}",
+                "type": "invalid_request_error",
+            },
+        )
+
+    if request.allow_voice_tags:
+        require_voice_tags_enabled()
+
+    if request.ssml:
+        await apply_ssml(request)
+
+    try:
+        # model_name = get_model_name(request.model)
+        tts_service = await get_tts_service()
+        voice_name = await process_and_validate_voices(
+            request.voice, tts_service, request.voice_aliases
+        )
+        # resolved here, not in the generator, so a bad tag 400s before the stream opens
+        request.input = await process_and_validate_voice_tags(
+            request.input, tts_service, request.allow_voice_tags, request.voice_aliases
+        )
+        apply_alias_rate(request)
+        # checked post-SSML and pre-stream, so an over-budget request 400s before headers
+        check_pause_budget(request.input)
+        check_speakable(
+            request.input,
+            request.allow_voice_tags,
+            request.normalization_options,
+        )
+
+        # Set content type based on format
+        content_type = {
+            "mp3": "audio/mpeg",
+            "opus": "audio/opus",
+            "aac": "audio/aac",
+            "flac": "audio/flac",
+            "wav": "audio/wav",
+            "pcm": "audio/pcm",
+        }.get(request.response_format, f"audio/{request.response_format}")
+
+        writer = StreamingAudioWriter(request.response_format, sample_rate=24000)
+
+        # Check if streaming is requested (default for OpenAI client)
+        if request.stream:
+            timings = (
+                [] if request.return_timing and request.return_download_link else None
+            )
+            # Create generator but don't start it yet
+            generator = stream_audio_chunks(
+                tts_service, request, client_request, writer, voice_name, timings
+            )
+
+            # If download link requested, wrap generator with temp file writer
+            if request.return_download_link:
+                from ..services.temp_manager import TempFileWriter
+
+                # Use download_format if specified, otherwise use response_format
+                output_format = request.download_format or request.response_format
+                temp_writer = TempFileWriter(output_format)
+                await temp_writer.__aenter__()  # Initialize temp file
+
+                # Get download path immediately after temp file creation
+                download_path = temp_writer.download_path
+
+                # Create response headers with download path
+                headers = {
+                    "Content-Disposition": f"attachment; filename=speech.{output_format}",
+                    "X-Accel-Buffering": "no",
+                    "Cache-Control": "no-cache",
+                    "Transfer-Encoding": "chunked",
+                    "X-Download-Path": download_path,
+                }
+                if timings is not None:
+                    headers["X-Timing-Path"] = f"{download_path}.json"
+
+                # Add header to indicate if temp file writing is available
+                if temp_writer._write_error:
+                    headers["X-Download-Status"] = "unavailable"
+
+                # Create async generator for streaming
+                async def dual_output():
+                    try:
+                        # Write chunks to temp file and stream
+                        async for chunk_data in generator:
+                            if chunk_data.output:  # Skip empty chunks
+                                await temp_writer.write(chunk_data.output)
+                                # if return_json:
+                                #    yield chunk, chunk_data
+                                # else:
+                                yield chunk_data.output
+
+                        # Finalize the temp file
+                        await temp_writer.finalize()
+                        if timings is not None:
+                            await temp_writer.write_json_sidecar({"chunks": timings})
+                    except Exception as e:
+                        logger.error(f"Error in dual output streaming: {e}")
+                        await temp_writer.__aexit__(type(e), e, e.__traceback__)
+                        raise
+                    finally:
+                        # Ensure temp writer is closed
+                        if not temp_writer._finalized:
+                            await temp_writer.__aexit__(None, None, None)
+                        await generator.aclose()
+                        writer.close()
+
+                # Stream with temp file writing
+                return StreamingResponse(
+                    dual_output(), media_type=content_type, headers=headers
+                )
+
+            async def single_output():
+                try:
+                    # Stream chunks
+                    async for chunk_data in generator:
+                        if chunk_data.output:  # Skip empty chunks
+                            yield chunk_data.output
+                except Exception as e:
+                    logger.error(f"Error in single output streaming: {e}")
+                    raise
+                finally:
+                    await generator.aclose()
+                    writer.close()
+
+            # Standard streaming without download link
+            return StreamingResponse(
+                single_output(),
+                media_type=content_type,
+                headers={
+                    "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
+                    "X-Accel-Buffering": "no",
+                    "Cache-Control": "no-cache",
+                    "Transfer-Encoding": "chunked",
+                },
+            )
+        else:
+            headers = {
+                "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
+                "Cache-Control": "no-cache",  # Prevent caching
+            }
+
+            # Generate complete audio using public interface
+            audio_data = await tts_service.generate_audio(
+                text=request.input,
+                voice=voice_name,
+                writer=writer,
+                speed=request.speed,
+                volume_multiplier=request.volume_multiplier,
+                normalization_options=request.normalization_options,
+                lang_code=request.lang_code,
+                allow_voice_tags=request.allow_voice_tags,
+                output_format=request.response_format,
+            )
+            output = audio_data.output
+
+            if request.return_download_link:
+                from ..services.temp_manager import TempFileWriter
+
+                # Use download_format if specified, otherwise use response_format
+                output_format = request.download_format or request.response_format
+                temp_writer = TempFileWriter(output_format)
+                await temp_writer.__aenter__()  # Initialize temp file
+
+                # Get download path immediately after temp file creation
+                download_path = temp_writer.download_path
+                headers["X-Download-Path"] = download_path
+
+                try:
+                    # Write chunks to temp file
+                    logger.info("Writing chunks to tempory file for download")
+                    await temp_writer.write(output)
+                    # Finalize the temp file
+                    await temp_writer.finalize()
+
+                except Exception as e:
+                    logger.error(f"Error in dual output: {e}")
+                    await temp_writer.__aexit__(type(e), e, e.__traceback__)
+                    raise
+                finally:
+                    # Ensure temp writer is closed
+                    if not temp_writer._finalized:
+                        await temp_writer.__aexit__(None, None, None)
+                    writer.close()
+
+            return Response(
+                content=output,
+                media_type=content_type,
+                headers=headers,
+            )
+
+    except ValueError as e:
+        # Handle validation errors
+        logger.warning(f"Invalid request: {str(e)}")
+
+        try:
+            writer.close()
+        except:
+            pass
+
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "validation_error",
+                "message": str(e),
+                "type": "invalid_request_error",
+            },
+        )
+    except RuntimeError as e:
+        # Handle runtime/processing errors
+        logger.error(f"Processing error: {str(e)}")
+
+        try:
+            writer.close()
+        except:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "processing_error",
+                "message": str(e),
+                "type": "server_error",
+            },
+        )
+    except Exception as e:
+        # Handle unexpected errors
+        logger.error(f"Unexpected error in speech generation: {str(e)}")
+
+        try:
+            writer.close()
+        except:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "processing_error",
+                "message": str(e),
+                "type": "server_error",
+            },
+        )
+
+
+# everything outside this set is collapsed out of a client-supplied save-as name
+_DOWNLOAD_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+_DOWNLOAD_NAME_EXT = re.compile(r"\.[A-Za-z0-9]{1,5}$")
+_DOWNLOAD_NAME_MAX_STEM = 100
+
+
+def _resolve_download_name(requested: str | None, stored_name: str) -> str:
+    """Resolve the save-as name for a download.
+
+    Strips a client-supplied name to a safe charset and always keeps the stored
+    file's real extension. Falls back to the stored (temp) name.
+    """
+    if not requested:
+        return stored_name
+
+    stem = _DOWNLOAD_NAME_EXT.sub("", _DOWNLOAD_NAME_UNSAFE.sub("_", requested))
+    stem = stem.strip("._-")[:_DOWNLOAD_NAME_MAX_STEM].strip("._-")
+    if not stem:
+        return stored_name
+
+    return f"{stem}{os.path.splitext(stored_name)[1]}"
+
+
+@router.get("/download/{filename}")
+async def download_audio_file(
+    filename: str,
+    name: str | None = Query(
+        None,
+        description="Preferred save-as name. Sanitized; the stored file's extension is kept.",
+    ),
+):
+    """Download a generated audio file from temp storage"""
+    try:
+        from ..core.paths import _find_file, get_content_type
+
+        # Search for file in temp directory
+        file_path = await _find_file(
+            filename=filename, search_paths=[settings.temp_file_dir]
+        )
+
+        # Get content type from path helper
+        content_type = await get_content_type(file_path)
+
+        # browsers honor Content-Disposition over an anchor's download attribute
+        download_name = _resolve_download_name(name, os.path.basename(file_path))
+
+        return FileResponse(
+            file_path,
+            media_type=content_type,
+            filename=download_name,
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    except FileNotFoundError:
+        logger.warning(f"Download file not found: {filename}")
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "not_found",
+                "message": "Audio file not found",
+                "type": "invalid_request_error",
+            },
+        )
+    except Exception as e:
+        logger.error(f"Error serving download file {filename}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "server_error",
+                "message": "Failed to serve audio file",
+                "type": "server_error",
+            },
+        )
+
+
+@router.get("/models")
+async def list_models():
+    """List all available models"""
+    try:
+        # Create standard model list
+        models = [
+            {
+                "id": "tts-1",
+                "object": "model",
+                "created": 1686935002,
+                "owned_by": "kokoro",
+            },
+            {
+                "id": "tts-1-hd",
+                "object": "model",
+                "created": 1686935002,
+                "owned_by": "kokoro",
+            },
+            {
+                "id": "kokoro",
+                "object": "model",
+                "created": 1686935002,
+                "owned_by": "kokoro",
+            },
+            {
+                "id": "gpt-4o-mini-tts",
+                "object": "model",
+                "created": 1686935002,
+                "owned_by": "kokoro",
+            },
+        ]
+
+        return {"object": "list", "data": models}
+    except Exception as e:
+        logger.error(f"Error listing models: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "server_error",
+                "message": "Failed to retrieve model list",
+                "type": "server_error",
+            },
+        )
+
+
+@router.get("/models/{model}")
+async def retrieve_model(model: str):
+    """Retrieve a specific model"""
+    try:
+        # Define available models
+        models = {
+            "tts-1": {
+                "id": "tts-1",
+                "object": "model",
+                "created": 1686935002,
+                "owned_by": "kokoro",
+            },
+            "tts-1-hd": {
+                "id": "tts-1-hd",
+                "object": "model",
+                "created": 1686935002,
+                "owned_by": "kokoro",
+            },
+            "kokoro": {
+                "id": "kokoro",
+                "object": "model",
+                "created": 1686935002,
+                "owned_by": "kokoro",
+            },
+        }
+
+        # Check if requested model exists
+        if model not in models:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "model_not_found",
+                    "message": f"Model '{model}' not found",
+                    "type": "invalid_request_error",
+                },
+            )
+
+        # Return the specific model
+        return models[model]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving model {model}: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "server_error",
+                "message": "Failed to retrieve model information",
+                "type": "server_error",
+            },
+        )
+
+
+@router.get("/audio/voices")
+async def list_voices(legacy: bool = False):
+    """List all available voices for text-to-speech.
+
+    Returns `[{"id": ..., "name": ...}, ...]` by default so OpenAI-compatible
+    clients (Open WebUI in particular, which does `voice['id']` directly and
+    silently falls back to a hardcoded 6-voice list otherwise) can render the
+    full voice list. Entries also carry `target_quality`, `training_duration`
+    and `overall_grade` for the voices graded in the upstream model card;
+    ungraded voices (Spanish, Brazilian Portuguese, custom `.pt` files) omit
+    those keys. `default_voice` is the DEFAULT_VOICE setting. Pass
+    `?legacy=true` for the pre-0.3.x plain-string shape.
+    """
+    try:
+        tts_service = await get_tts_service()
+        voices = await tts_service.list_voices()
+        if legacy:
+            return {"voices": voices}
+        return {
+            "voices": [
+                {"id": v, "name": v, **_voice_grades.get(v, {})} for v in voices
+            ],
+            "default_voice": settings.default_voice,
+        }
+    except Exception as e:
+        logger.error(f"Error listing voices: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "server_error",
+                "message": "Failed to retrieve voice list",
+                "type": "server_error",
+            },
+        )
+
+
+@router.post("/audio/voices/combine")
+async def combine_voices(request: Union[str, List[str]]):
+    """Combine voices and return the .pt file.
+
+    Accepts the speech endpoints' voice syntax ("voice1+voice2",
+    "voice1(2)+voice2(1)") or a list of voice names.
+    """
+    # Check if local voice saving is allowed
+    if not settings.allow_local_voice_saving:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "permission_denied",
+                "message": "Local voice saving is disabled",
+                "type": "permission_error",
+            },
+        )
+
+    try:
+        if isinstance(request, list):
+            request = "+".join(v.strip() for v in request if v.strip())
+
+        tts_service = await get_tts_service()
+        voice_string = await process_and_validate_voices(request, tts_service)
+        combined_name, voice_path = await tts_service.get_voices_path(voice_string)
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", combined_name).strip("._-")
+
+        return FileResponse(
+            voice_path,
+            media_type="application/octet-stream",
+            filename=f"{safe_name or 'voice'}.pt",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    except ValueError as e:
+        logger.warning(f"Invalid voice combination request: {str(e)}")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "validation_error",
+                "message": str(e),
+                "type": "invalid_request_error",
+            },
+        )
+    except RuntimeError as e:
+        logger.error(f"Voice combination processing error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "processing_error",
+                "message": "Failed to process voice combination request",
+                "type": "server_error",
+            },
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error in voice combination: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "server_error",
+                "message": "An unexpected error occurred",
+                "type": "server_error",
+            },
+        )

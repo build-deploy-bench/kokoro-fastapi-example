@@ -1,0 +1,35 @@
+import { expect, test } from './fixtures/app.mjs';
+
+test('cancel mid-generation keeps the controls consistent', async ({ page }) => {
+    const pageErrors = [];
+    page.on('pageerror', (error) => pageErrors.push(error));
+
+    await page.route('**/v1/audio/speech', async (route) => {
+        await new Promise((resolve) => setTimeout(resolve, 10_000));
+        await route.abort().catch(() => {});
+    });
+
+    await page.goto('/');
+    await page.locator('.page-content').fill('A sentence that never finishes generating.');
+    await page.locator('#generate-btn').click();
+
+    await expect(page.locator('#cancel-btn')).toBeVisible();
+    await page.locator('#cancel-btn').click();
+
+    await expect(page.locator('#cancel-btn')).toBeHidden();
+    await expect(page.locator('#volume-slider')).toHaveValue('100');
+
+    const timeDisplayWrites = await page.evaluate(() => new Promise((resolve) => {
+        let count = 0;
+        const observer = new MutationObserver(() => { count += 1; });
+        observer.observe(document.getElementById('time-display'), {
+            childList: true,
+            characterData: true,
+            subtree: true,
+        });
+        setTimeout(() => { observer.disconnect(); resolve(count); }, 500);
+    }));
+
+    expect(timeDisplayWrites).toBe(0);
+    expect(pageErrors).toEqual([]);
+});
