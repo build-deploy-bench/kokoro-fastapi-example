@@ -24,7 +24,8 @@ install() {
   mark install_start
   uv venv --python 3.12
   uv sync --frozen --extra cpu --no-install-project
-  .venv/bin/python download_model.py --output api/src/models/v1_0
+  # Outside api/, so the app source layers of the image do not contain the model again.
+  .venv/bin/python download_model.py --output models/v1_0
   install_unidic
   mark install_done
 }

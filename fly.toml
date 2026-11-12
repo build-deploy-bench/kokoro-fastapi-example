@@ -3,6 +3,9 @@
 # harness, not stored here. Fly builds the root Dockerfile, the same file as the other providers.
 primary_region = "iad"
 
+[build]
+  dockerfile = "Dockerfile"
+
 [http_service]
   internal_port = 8880
   force_https = true
