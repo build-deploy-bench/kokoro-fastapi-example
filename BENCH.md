@@ -49,7 +49,7 @@ Measured locally with `docker run --cpus=1 --memory=<limit>` (arm64 image) on 20
 - 1.5 GB: boots and answers a TTS request, but the cgroup sits at its limit (peak 1.5 GiB).
 - 2 GB: boots in about 10 s; after one TTS request `anon` memory is 1.39 GiB.
 
-All providers use 2 GB: Render `standard` (1 CPU, 2 GB), Railway limits 1 vCPU / 2 GB, Fly `shared-cpu-1x` with 2048 MB, Vercel's default function memory (2 GB). Keep the services suspended or stopped outside measurements.
+Render and Fly need a 2 GB instance, because their defaults are too small (Render `starter` 512 MB, Fly `fly launch` 1 GB): Render `standard` (1 CPU, 2 GB) and Fly `shared-cpu-1x` with 2048 MB. Railway (up to 24 vCPU / 24 GB per replica on Pro) and Vercel (2 GB function memory) run it on their defaults. Keep the services suspended or stopped outside measurements.
 
 ## Providers
 
@@ -63,7 +63,7 @@ All providers use 2 GB: Render `standard` (1 CPU, 2 GB), Railway limits 1 vCPU /
 ### Railway
 
 - Project `bdb-kokoro-fastapi` `9c278cfa-88f6-4a4d-8be7-fb9fc65dd755`, environment `production` `b9a5fa59-479e-40ef-80d0-a73bb9428f28`, service `767b0c1c-bf6a-4dd3-9aa3-75389f0397b4`. https://bdb-kokoro-fastapi-production.up.railway.app (domain on port 8880).
-- Source `build-deploy-bench/kokoro-fastapi-example` `main`. Railway uses the root `Dockerfile`. Health check `/health`. Variables: `PORT=8880`. Limits: 1 vCPU, 2 GB (`serviceInstanceLimitsUpdate`). The other fixtures keep Railway's default limits; this one is limited to match the 2 GB instances on the other providers. Region not set (default).
+- Source `build-deploy-bench/kokoro-fastapi-example` `main`. Railway uses the root `Dockerfile`. Health check `/health`. Variables: `PORT=8880`. Railway's default limits (24 vCPU / 24 GB). Setup limited the service to 1 vCPU / 2 GB to match the other providers; that limit was removed on 2026-11-12, so the matrix check below ran with it. Region not set (default).
 - Auto-deploy disabled after `serviceConnect` and confirmed with `serviceInstanceAutoDeployStatus`.
 - Setup deploy `5e83ddf3-bab0-4203-a70c-d06b2ad0d4c8` of `56b9533` (the connect deploy): `SUCCESS`. All four build markers, image push 1.61 GB in 66 s, `/version` returned the right commit and the deployment ID. `start` to `listening` took 85 s, much longer than on the other providers.
 - Removed after the setup deploy (`deploymentRemove`).
@@ -71,7 +71,7 @@ All providers use 2 GB: Render `standard` (1 CPU, 2 GB), Railway limits 1 vCPU /
 ### Vercel
 
 - Team `build-deploy-bench`. Project `bdb-kokoro-fastapi` `prj_mxh7GMxqsrGsDAVeHlqxZUu8YblO`, https://bdb-kokoro-fastapi.vercel.app. No Git link; deploys upload a clean context with `vercel deploy --prod`.
-- Container builder through `builds` in `vercel.json` (patch 7). Function region `iad1`, default memory 2 GB. Build machine `standard` (elastic, the project default; the build ran in `cle1`). Project env `PORT=8880` (production), which sets the routed port.
+- Container builder through `builds` in `vercel.json` (patch 7). Function region `iad1`, default memory 2 GB. Build machine `standard`, selection `fixed` (the setup build ran on the elastic default; it also chose `standard`, in `cle1`). Project env `PORT=8880` (production), which sets the routed port.
 - Deploy `dpl_5ZUFCxYuWPAzmVuuB8QhyuCA2uEn` of `0dba0e3`: `READY`. All four build markers, install 133 s, build (Buildah total) 320 s, push 57 s. Vercel started four instances right after `READY`; each logged `::bench::listening`. `/version` returned `run` = `setup-vercel-2` and `commit` = `unknown` (no commit SHA after a CLI upload, the same as the other fixtures). The CLI log view showed only the last lines of each instance, without `::bench::start`.
 - Scales to zero by itself.
 
@@ -89,6 +89,6 @@ All providers use 2 GB: Render `standard` (1 CPU, 2 GB), Railway limits 1 vCPU /
 | Provider | Cold e2e | Warm e2e | Notes |
 |---|---|---|---|
 | Render | 356 s | 134 s | Resume (`service_resumed`) took 353 s before the runs. Cold cache export to the registry 110 s. Warm `observed_cache` is `partial` and has no install time. |
-| Railway | 677 s | 367 s | App boot (start to listening) 134 s cold and 83 s warm on 1 vCPU, against 20 to 25 s on Render and 16 s on Vercel. |
+| Railway | 677 s | 367 s | App boot (start to listening) 134 s cold and 83 s warm on 1 vCPU (the limit since removed), against 20 to 25 s on Render and 16 s on Vercel. |
 | Vercel | 451 s | 607 s, 208 s | The first warm run restored the build cache of the setup deploy `dpl_5ZUFCxYuWPAzmVuuB8QhyuCA2uEn` (older `bench/build.sh`), not of the cold run, so the install step ran again. A second warm run hit the cache (restore 56 s, 3.3 GiB). |
 | Fly | 865 s | 202 s | Under the Fly build lock, with the remote builder (`--depot=false`). Cold: install 372 s, image push 122 s. Warm: install cached, push 13 s. App boot 48 s in both runs. |
