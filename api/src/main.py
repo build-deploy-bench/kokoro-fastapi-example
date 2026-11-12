@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 
 import torch
@@ -74,6 +75,21 @@ class _WebPlayerStartupHandler(logging.Handler):
 
 if settings.enable_web_player:
     logging.getLogger("uvicorn.error").addHandler(_WebPlayerStartupHandler())
+
+
+class _BenchListeningHandler(logging.Handler):
+    """Print the benchmark listening marker when uvicorn has bound its socket.
+
+    uvicorn logs "Uvicorn running on" after the lifespan startup (model load and warmup) and the bind, so the marker
+    is the time from which the app accepts connections. It carries the wall-clock time in epoch milliseconds.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if str(record.msg).startswith("Uvicorn running on"):
+            print(f"::bench::listening {time.time_ns() // 1_000_000}", flush=True)
+
+
+logging.getLogger("uvicorn.error").addHandler(_BenchListeningHandler())
 
 
 @asynccontextmanager
@@ -200,6 +216,29 @@ if settings.enable_web_player:
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy"}
+
+
+def _read_build_commit() -> str:
+    """Return the commit that bench/build.sh recorded at build time, or "unknown" without a build."""
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "..", "..", ".build-commit")) as f:
+            return f.read().strip() or "unknown"
+    except FileNotFoundError:
+        return "unknown"
+
+
+BUILD_COMMIT = _read_build_commit()
+# The benchmark harness sets BENCH_RUN_ID before each deploy, and each deployment keeps the env it started with.
+RUN_ID = os.environ.get("BENCH_RUN_ID") or "unknown"
+# Railway gets no BENCH_RUN_ID: a changed variable invalidates part of its build cache. Its own deployment ID
+# identifies the deployment instead.
+DEPLOYMENT_ID = os.environ.get("RAILWAY_DEPLOYMENT_ID") or "unknown"
+
+
+@app.get("/version")
+async def version():
+    """Identify the running deployment for the build-deploy benchmark."""
+    return {"commit": BUILD_COMMIT, "run": RUN_ID, "deployment": DEPLOYMENT_ID}
 
 
 @app.get("/v1/test")
