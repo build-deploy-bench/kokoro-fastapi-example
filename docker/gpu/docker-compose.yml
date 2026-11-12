@@ -1,0 +1,34 @@
+name: kokoro-fastapi-gpu
+services:
+  kokoro-tts:
+    image: ghcr.io/remsky/kokoro-fastapi-gpu:${VERSION:-latest}
+    build:
+      context: ../..
+      dockerfile: docker/gpu/Dockerfile.optimized
+      cache_from:
+        - ghcr.io/remsky/kokoro-fastapi-cache:gpu-amd64
+        - ghcr.io/remsky/kokoro-fastapi-cache:gpu-arm64
+      # Default builds cu126 wheels, multi-arch (Maxwell through Ada: GTX 9xx, 10xx, 20xx, 30xx, 40xx).
+      # Temp fix for NVIDIA Blackwell / RTX 50-series, uncomment:
+      # args:
+      #   GPU_EXTRA: gpu-cu128
+      #   CUDA_VERSION: 12.8.1
+    volumes:
+      - ../../web:/app/web  # hot reload changes to web player code
+    ports:
+      - "8880:8880"
+    env_file:
+      - path: ../../.env
+        required: false
+    environment:  # full list in docs/configuration.md
+      - API_LOG_LEVEL=DEBUG
+      # - ENABLE_INNO_TUNER=true
+      # - ALLOW_DEV_UNLOAD=true
+      # - ENABLE_DEBUG_ENDPOINTS=true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

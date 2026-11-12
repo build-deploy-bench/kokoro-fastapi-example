@@ -1,0 +1,90 @@
+# Contributing to Kokoro-FastAPI
+
+Always appreciate community involvement in making this project better. 
+
+For the repo layout, common commands, and conventions, see [AGENTS.md](AGENTS.md).
+
+## Development Setup
+
+We use `uv` for managing Python environments and dependencies, and `ruff` for linting and formatting.
+
+1.  **Clone the repository:**
+    ```bash
+    git clone https://github.com/remsky/Kokoro-FastAPI.git
+    cd Kokoro-FastAPI
+    ```
+
+2.  **Install `uv`:**
+    Follow the instructions on the [official `uv` documentation](https://docs.astral.sh/uv/install/).
+
+3.  **Create a virtual environment and install dependencies:**
+    It's recommended to use a virtual environment. `uv` can create one for you. Install the base dependencies along with the `test` and `cpu` extras (needed for running tests locally).
+    ```bash
+    # Create and activate a virtual environment (e.g., named .venv)
+    uv venv
+    source .venv/bin/activate # On Linux/macOS
+    # .venv\Scripts\activate # On Windows
+
+    # Install dependencies including test requirements
+    uv sync --extra test --extra cpu
+    ```
+    *Note: If you have an NVIDIA GPU and want to test GPU-specific features locally, use `--extra gpu` instead, ensuring you have the correct CUDA toolkit installed.*
+
+    *Note: If running via uv locally, you need espeak-ng installed and on your PATH. The Docker images handle this automatically.*
+
+## Running Tests
+
+Before submitting changes, make sure all tests pass. CI checks this automatically. The tests are run using `pytest`. 
+```bash
+# Make sure your virtual environment is activated
+uv run pytest
+```
+*Note: CI runs `ruff check .`, `uv run --extra test --extra cpu pytest api/tests/` on Python 3.10 and 3.12, plus `npm run test:web` and `npm run test:e2e` for the web player. Running `uv run pytest` locally should cover the essential checks.*
+
+## Testing with Docker Compose
+
+In addition to local `pytest` runs, test your changes using Docker Compose to ensure they work correctly within the containerized environment. If you aren't able to test on CUDA hardware, say so in the PR so another maintainer can test it.
+
+```bash
+
+docker compose -f docker/cpu/docker-compose.yml up --build
+docker compose -f docker/gpu/docker-compose.yml up --build
+```
+These commands build the images (if they changed) and start the services in each compose file. Make sure the app starts, then test what you changed.
+
+## Code Formatting and Linting
+
+We use `ruff` to maintain code quality and consistency. Please format and lint your code before committing. The version is pinned in the `lint` dependency group, so these match CI.
+
+1.  **Format the code:**
+    ```bash
+    uv run --only-group lint ruff format .
+    ```
+
+2.  **Lint the code (and apply automatic fixes):**
+    ```bash
+    uv run --only-group lint ruff check . --fix
+    ```
+    Review any changes made by `--fix` and address any remaining linting errors manually.
+
+## Skills
+
+Task guides in `.claude/skills/`, written for coding agents, readable as plain markdown:
+
+- [api-contrib](.claude/skills/api-contrib/SKILL.md): API module layout, endpoint gating, test expectations.
+- [web-contrib](.claude/skills/web-contrib/SKILL.md): web player constraints, MSE gotchas, unit and e2e tests.
+- [adding-normalizer](.claude/skills/adding-normalizer/SKILL.md): adding a language normalizer.
+- [integration-tests](.claude/skills/integration-tests/SKILL.md): the e2e suite against a live server.
+- [readme-benchmarks](.claude/skills/readme-benchmarks/SKILL.md): benchmark runs and README plots.
+- [consumer-check](.claude/skills/consumer-check/SKILL.md): finding downstream users a behavior change could break.
+
+## Submitting Changes
+
+0.  Fork the repo and clone your fork.
+1.  Create a new branch for your feature or bug fix.
+2.  Make your changes, following setup, testing, and formatting guidelines above.
+3.  Please try to keep your changes in line with the current design, and modular, and pass tasts and lint locally before creating a PR. Large-scale changes will take longer to review and integrate, and have less chance of being approved outright.
+4.  Push your branch to your fork.
+5.  Open a Pull Request against the `master` branch of the main repository.
+
+Thank you for contributing!

@@ -1,0 +1,8 @@
+#!/bin/bash
+set -e
+
+if [ "${DOWNLOAD_MODEL:-true}" = "true" ]; then
+    python download_model.py --output api/src/models/v1_0
+fi
+
+exec python -m uvicorn api.src.main:app --host "${HOST:-0.0.0.0}" --port "${PORT:-8880}" --log-level debug
