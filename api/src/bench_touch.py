@@ -1,1 +1,1 @@
-BENCH_TOUCH = "2026-11-12-full-render-docker-large-r3-020008"
+BENCH_TOUCH = "2026-11-12-full-fly-docker-large-r1-030736"
