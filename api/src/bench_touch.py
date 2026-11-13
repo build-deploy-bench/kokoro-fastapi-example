@@ -1,1 +1,1 @@
-BENCH_TOUCH = "2026-11-13-gh4-fly-docker-large-r3-221057"
+BENCH_TOUCH = "2026-11-13-gh4-vercel-docker-large-r1-225726"
