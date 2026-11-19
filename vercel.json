@@ -1,0 +1,5 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "builds": [{ "src": "Dockerfile", "use": "@vercel/container" }],
+  "git": { "deploymentEnabled": false }
+}
