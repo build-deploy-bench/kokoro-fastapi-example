@@ -1,1 +1,1 @@
-BENCH_TOUCH = "2026-11-20-gh11-vercel-docker-large-r3-075714"
+BENCH_TOUCH = "2026-11-20-gh11-render-docker-large-r1-081045"
