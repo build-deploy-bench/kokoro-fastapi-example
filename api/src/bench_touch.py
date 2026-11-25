@@ -1,1 +1,1 @@
-BENCH_TOUCH = "2026-11-23-gh12-render-docker-large-r3-082122"
+BENCH_TOUCH = "2026-11-25-gh13-railway-docker-large-r1-065631"
